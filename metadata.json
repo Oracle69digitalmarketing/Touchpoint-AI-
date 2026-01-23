@@ -1,0 +1,7 @@
+{
+  "name": "Touchpoint AI",
+  "description": "The conversational infrastructure for physical commerce. Transform static touchpoints like QR codes and NFC chips into intelligent sales agents that qualify leads and close deals.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
