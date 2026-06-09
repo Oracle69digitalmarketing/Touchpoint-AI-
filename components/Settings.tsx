@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink } from 'lucide-react';
+import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink, ShieldCheck } from 'lucide-react';
 import { SUPPORTED_LANGUAGES, CRMConnection, SubscriptionPlan, PLAN_LIMITS } from '../types';
 
 interface Props {
@@ -29,6 +29,34 @@ const Settings: React.FC<Props> = ({
   const [isSubModalOpen, setIsSubModalOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const [deleteKeyword, setDeleteKeyword] = useState('');
+
+  // Identity Verification State
+  const [banks, setBanks] = useState<{name: string, code: string}[]>([]);
+  const [accountNumber, setAccountNumber] = useState('');
+  const [selectedBank, setSelectedBank] = useState('');
+  const [resolvingAccount, setResolvingAccount] = useState(false);
+  const [verifiedData, setVerifiedData] = useState<{account_name: string} | null>(null);
+
+  const fetchBanks = async () => {
+    try {
+      const res = await fetch(`${window.location.origin.includes('localhost:3000') ? 'http://localhost:3001/v1' : '/v1'}/identity/banks`);
+      const data = await res.json();
+      if (data.status) setBanks(data.data);
+    } catch (e) { console.error("Bank fetch failed"); }
+  };
+
+  const handleVerifyAccount = async () => {
+    if (!accountNumber || !selectedBank) return;
+    setResolvingAccount(true);
+    setVerifiedData(null);
+    try {
+      const res = await fetch(`${window.location.origin.includes('localhost:3000') ? 'http://localhost:3001/v1' : '/v1'}/identity/resolve-account?account_number=${accountNumber}&bank_code=${selectedBank}`);
+      const data = await res.json();
+      if (data.status) setVerifiedData(data.data);
+      else alert(data.message || "Could not verify account");
+    } catch (e) { alert("Verification failed"); }
+    setResolvingAccount(false);
+  };
 
   const plans = Object.keys(PLAN_LIMITS).map(key => {
     const planKey = key as SubscriptionPlan;
@@ -144,6 +172,72 @@ const Settings: React.FC<Props> = ({
                   </button>
                 </div>
               ))}
+            </div>
+          </section>
+
+          {/* Identity Verification Section */}
+          <section className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-sm">
+            <div className="flex items-center gap-4 mb-8">
+              <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center">
+                <ShieldCheck size={24} />
+              </div>
+              <div>
+                <h3 className="text-xl font-bold text-slate-900">Trust & Identity</h3>
+                <p className="text-sm text-slate-500 font-medium">Verify your business identity to unlock higher infrastructure limits.</p>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Select Institution</label>
+                  <select 
+                    onFocus={fetchBanks}
+                    onChange={(e) => setSelectedBank(e.target.value)}
+                    className="w-full px-5 py-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-bold text-slate-700 appearance-none"
+                  >
+                    <option value="">Choose Bank...</option>
+                    {banks.map(bank => (
+                      <option key={bank.code} value={bank.code}>{bank.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Account Number</label>
+                  <input 
+                    type="text" 
+                    maxLength={10}
+                    value={accountNumber}
+                    onChange={(e) => setAccountNumber(e.target.value)}
+                    placeholder="0123456789"
+                    className="w-full px-5 py-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-bold text-slate-700"
+                  />
+                </div>
+              </div>
+
+              {verifiedData ? (
+                <div className="p-6 bg-emerald-50 border border-emerald-100 rounded-[32px] flex items-center justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className="w-10 h-10 bg-emerald-500 text-white rounded-full flex items-center justify-center shadow-lg">
+                      <Check size={20} />
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest">Identity Verified</p>
+                      <p className="text-sm font-black text-slate-900">{verifiedData.account_name}</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setVerifiedData(null)} className="text-[10px] font-bold text-slate-400 uppercase hover:text-slate-600 transition-colors">Reset</button>
+                </div>
+              ) : (
+                <button 
+                  onClick={handleVerifyAccount}
+                  disabled={resolvingAccount || !accountNumber || !selectedBank}
+                  className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {resolvingAccount ? <Loader2 size={18} className="animate-spin" /> : <Shield size={18} />}
+                  Verify Business Identity
+                </button>
+              )}
             </div>
           </section>
 
