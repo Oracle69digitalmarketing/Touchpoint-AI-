@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { MessageSquare, ShieldCheck, FileText, Bot, Loader2, Globe } from 'lucide-react';
 import { Conversation, Agent, SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES } from '../types';
-import { simulateAgentConversation } from '../services/gemini';
+import { simulateAgentConversation } from '../services/ai';
 
 interface Props {
   conversations: Conversation[];

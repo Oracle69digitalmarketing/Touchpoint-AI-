@@ -8,14 +8,14 @@ import SurfaceGenerator from './components/SurfaceGenerator';
 import AgentTrainingWizard from './components/AgentTrainingWizard';
 import ConversationHub from './components/ConversationHub';
 import Settings from './components/Settings';
-import { Agent, Touchpoint, Conversation, CRMConnection, SubscriptionPlan, PLAN_LIMITS } from './types';
+import { Agent, Touchpoint, Conversation, CRMConnection, SubscriptionPlan, PLAN_LIMITS, AgentStatus, SurfaceType } from './types';
 import { crmService } from './services/crm';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [language, setLanguage] = useState('en');
-  const [currency, setCurrency] = useState('USD');
+  const [currency, setCurrency] = useState('NGN');
   
   // Persistence States
   const [subscription, setSubscription] = useState<SubscriptionPlan>('Free');

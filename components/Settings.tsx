@@ -18,6 +18,8 @@ interface Props {
 const Settings: React.FC<Props> = ({ 
   currentLanguage, 
   onLanguageChange,
+  currentCurrency,
+  onCurrencyChange,
   crms,
   onConnectCRM,
   onDisconnectCRM,
@@ -28,11 +30,45 @@ const Settings: React.FC<Props> = ({
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const [deleteKeyword, setDeleteKeyword] = useState('');
 
-  const plans: {name: SubscriptionPlan, price: string, features: string[]}[] = [
-    { name: 'Free', price: '$0', features: ['1 Agent', '5 Touchpoints', 'Basic Analytics'] },
-    { name: 'Professional', price: '$49/mo', features: ['5 Agents', '50 Touchpoints', 'CRM Sync', 'Pro Analytics'] },
-    { name: 'Enterprise Pro', price: '$199/mo', features: ['100 Agents', '1000 Touchpoints', 'NFC Triggers', 'Dedicated Support'] }
-  ];
+  const plans = Object.keys(PLAN_LIMITS).map(key => {
+    const planKey = key as SubscriptionPlan;
+    const plan = PLAN_LIMITS[planKey];
+    const isUSD = currentCurrency === 'USD';
+    const priceValue = isUSD ? plan.price.USD : plan.price.NGN;
+    const priceLabel = priceValue === -1 ? 'Custom' : isUSD ? `$${priceValue}` : `₦${priceValue.toLocaleString()}`;
+
+    return {
+      name: planKey,
+      price: priceLabel,
+      amount: priceValue,
+      features: plan.features
+    };
+  });
+
+  const handlePaystackPayment = (planName: SubscriptionPlan, amount: number) => {
+    if (amount <= 0) {
+      setSubscription(planName);
+      setIsSubModalOpen(false);
+      return;
+    }
+
+    const handler = (window as any).PaystackPop.setup({
+      key: (import.meta as any).env.VITE_PAYSTACK_PUBLIC_KEY || process.env.PAYSTACK_PUBLIC_KEY,
+      email: 'customer@example.com', // In a real app, use the logged-in user's email
+      amount: amount * 100, // Paystack expects amount in kobo or cents
+      currency: currentCurrency === 'NGN' ? 'NGN' : 'USD',
+      callback: (response: any) => {
+        console.log('Payment successful', response);
+        setSubscription(planName);
+        setIsSubModalOpen(false);
+        alert(`Success! You have been upgraded to the ${planName} tier.`);
+      },
+      onClose: () => {
+        console.log('Window closed');
+      }
+    });
+    handler.openIframe();
+  };
 
   const handleCrmClick = (crm: CRMConnection) => {
     if (crm.status === 'connected') {
@@ -216,7 +252,7 @@ const Settings: React.FC<Props> = ({
                       ))}
                     </ul>
                     <button 
-                      onClick={() => { setSubscription(plan.name); setIsSubModalOpen(false); }}
+                      onClick={() => handlePaystackPayment(plan.name, plan.amount)}
                       disabled={subscription === plan.name}
                       className={`w-full py-3 rounded-xl font-bold text-sm transition-all ${
                         subscription === plan.name 
@@ -224,7 +260,7 @@ const Settings: React.FC<Props> = ({
                           : 'bg-white border border-slate-200 text-slate-900 hover:bg-slate-900 hover:text-white'
                       }`}
                     >
-                      {subscription === plan.name ? 'Current Active Plan' : `Upgrade to ${plan.name}`}
+                      {subscription === plan.name ? 'Current Active Plan' : plan.amount === -1 ? 'Contact Sales' : `Upgrade to ${plan.name}`}
                     </button>
                   </div>
                 ))}
@@ -235,8 +271,8 @@ const Settings: React.FC<Props> = ({
                     <CreditCard size={24} />
                   </div>
                   <div>
-                    <p className="text-sm font-bold text-slate-900">Secure Billing via Stripe</p>
-                    <p className="text-xs text-slate-400">Payment methods are encrypted and handled externally.</p>
+                    <p className="text-sm font-bold text-slate-900">Secure Billing via Paystack</p>
+                    <p className="text-xs text-slate-400">Payment methods are encrypted and handled securely in Nigeria.</p>
                   </div>
                 </div>
                 <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" className="text-xs font-bold text-indigo-600 flex items-center gap-1 hover:underline">

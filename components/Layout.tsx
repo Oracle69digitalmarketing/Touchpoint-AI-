@@ -128,6 +128,22 @@ const Layout: React.FC<LayoutProps> = ({
         </header>
         <div className="p-6 lg:p-12 max-w-[1600px] mx-auto w-full">{children}</div>
       </main>
+
+      {/* MOBILE BOTTOM NAVIGATION */}
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-2xl border-t border-slate-200 px-4 py-3 flex justify-around items-center z-50 pb-safe">
+        {navItems.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => setActiveTab(item.id)}
+            className={`flex flex-col items-center gap-1 transition-all duration-300 ${
+              activeTab === item.id ? 'text-indigo-600' : 'text-slate-400'
+            }`}
+          >
+            <item.icon size={20} className={activeTab === item.id ? 'animate-bounce' : ''} />
+            <span className="text-[10px] font-black uppercase tracking-tighter">{item.label}</span>
+          </button>
+        ))}
+      </nav>
     </div>
   );
 };
