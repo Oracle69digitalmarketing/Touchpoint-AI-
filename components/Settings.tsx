@@ -74,6 +74,14 @@ const Settings: React.FC<Props> = ({
   });
 
   const handlePaystackPayment = (planName: SubscriptionPlan, amount: number) => {
+    if (amount === -1) {
+      // Redirect to WhatsApp for Enterprise leads
+      const phoneNumber = "2348000000000"; // REPLACE WITH YOUR REAL NUMBER
+      const message = `Hi, I am interested in the Enterprise plan for Touchpoint AI. Please provide more details on White-label and NFC orchestration.`;
+      window.open(`https://wa.me/${phoneNumber}?text=${encodeURIComponent(message)}`, '_blank');
+      return;
+    }
+
     if (amount <= 0) {
       setSubscription(planName);
       setIsSubModalOpen(false);
