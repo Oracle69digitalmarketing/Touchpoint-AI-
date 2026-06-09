@@ -8,6 +8,7 @@ import SurfaceGenerator from './components/SurfaceGenerator';
 import AgentTrainingWizard from './components/AgentTrainingWizard';
 import ConversationHub from './components/ConversationHub';
 import Settings from './components/Settings';
+import OnboardingGuide from './components/OnboardingGuide';
 import { Agent, Touchpoint, Conversation, CRMConnection, SubscriptionPlan, PLAN_LIMITS, AgentStatus, SurfaceType } from './types';
 import { crmService } from './services/crm';
 
@@ -114,6 +115,8 @@ const App: React.FC = () => {
           crms={crms} onConnectCRM={handleConnectCRM} onDisconnectCRM={handleDisconnectCRM}
           subscription={subscription} setSubscription={setSubscription}
         /></div>;
+      case 'onboarding':
+        return <div className={contentClass}><OnboardingGuide /></div>;
       default:
         return <div className={contentClass}><Dashboard touchpoints={touchpoints} agents={agents} currentCurrency={currency} /></div>;
     }
