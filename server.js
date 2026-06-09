@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import Groq from 'groq-sdk';
+import axios from 'axios';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +17,8 @@ const PORT = process.env.PORT || 3000;
 const groq = new Groq({ 
   apiKey: process.env.GROQ_API_KEY 
 });
+
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
 /**
  * MIDDLEWARE
@@ -98,6 +101,49 @@ app.post('/v1/ai/proposal', async (req, res) => {
     res.json(JSON.parse(completion.choices[0]?.message?.content || '{}'));
   } catch (error) {
     res.status(500).json({ error: "Proposal error" });
+  }
+});
+
+/**
+ * IDENTITY MANAGEMENT (PAYSTACK)
+ */
+
+// Resolve Account Number
+app.get('/v1/identity/resolve-account', async (req, res) => {
+  const { account_number, bank_code } = req.query;
+
+  try {
+    const response = await axios.get(`https://api.paystack.co/bank/resolve`, {
+      params: { account_number, bank_code },
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(error.response?.data || { error: "Identity resolution failed" });
+  }
+});
+
+// BVN Resolution
+app.get('/v1/identity/resolve-bvn/:bvn', async (req, res) => {
+  try {
+    const response = await axios.get(`https://api.paystack.co/bank/resolve_bvn/${req.params.bvn}`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(error.response?.data || { error: "BVN resolution failed" });
+  }
+});
+
+// Fetch Bank List
+app.get('/v1/identity/banks', async (req, res) => {
+  try {
+    const response = await axios.get(`https://api.paystack.co/bank`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: "Could not fetch banks" });
   }
 });
 
