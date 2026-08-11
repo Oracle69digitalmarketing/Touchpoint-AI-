@@ -1,14 +1,14 @@
 
 import { CRMConnection } from '../types';
+import { getAuthHeaders } from './auth';
 
 /**
  * BACKEND CONFIGURATION
+ * Relative URL works in production (same origin) and in development
+ * (Vite proxies /v1 to the Express API server).
  */
 const API_CONFIG = {
-  // Use relative URL in production so it works on any host
-  BASE_URL: window.location.origin.includes('localhost:3000') 
-    ? 'http://localhost:3001/v1' 
-    : '/v1', 
+  BASE_URL: '/v1',
 };
 
 export const crmService = {
@@ -21,9 +21,7 @@ export const crmService = {
     try {
       const response = await fetch(`${API_CONFIG.BASE_URL}/crm/connect`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json'
-        },
+        headers: getAuthHeaders(true),
         body: JSON.stringify({ providerId: crmId })
       });
 
@@ -52,7 +50,8 @@ export const crmService = {
 
     try {
       const response = await fetch(`${API_CONFIG.BASE_URL}/crm/disconnect/${crmId}`, {
-        method: 'DELETE'
+        method: 'DELETE',
+        headers: getAuthHeaders()
       });
       return response.ok;
     } catch (err) {

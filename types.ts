@@ -1,3 +1,24 @@
+import { PLAN_LIMITS as PLAN_LIMITS_SOURCE } from './plan-limits.js';
+
+export interface Business {
+  id: string;
+  name: string;
+  slug: string;
+  plan?: SubscriptionPlan;
+}
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: User;
+  business: Business;
+}
 
 export enum AgentStatus {
   TRAINING = 'Training',
@@ -32,7 +53,11 @@ export interface Agent {
   conversionRate: number;
   description?: string;
   serviceCatalog?: string;
+  clientProfiles?: string;
+  caseLibrary?: string;
+  guidelines?: string;
   documents?: string[];
+  createdAt?: string;
 }
 
 export interface Touchpoint {
@@ -44,6 +69,10 @@ export interface Touchpoint {
   active: boolean;
   location: string;
   trackingId: string;
+  url?: string;
+  agentName?: string;
+  agentStatus?: AgentStatus;
+  createdAt?: string;
 }
 
 export interface Conversation {
@@ -54,6 +83,39 @@ export interface Conversation {
   stage: ConversationStage;
   isQualified: boolean;
   timestamp: string;
+}
+
+export type LeadQualificationStatus = 'qualified' | 'unqualified' | 'pending';
+
+export interface Lead {
+  id: string;
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  intent: string | null;
+  qualificationScore: number;
+  qualificationStatus: LeadQualificationStatus;
+  source: 'auto' | 'manual';
+  notified: boolean;
+  touchpointId: string | null;
+  touchpointName: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  conversationId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LeadNotification {
+  id: string;
+  leadId: string;
+  leadName: string | null;
+  phone: string | null;
+  email: string | null;
+  qualificationScore: number;
+  qualificationStatus: LeadQualificationStatus;
+  readAt: string | null;
+  createdAt: string;
 }
 
 export interface CRMConnection {
@@ -67,43 +129,40 @@ export interface CRMConnection {
 
 export type SubscriptionPlan = 'Free' | 'Starter' | 'Growth' | 'Business' | 'Enterprise';
 
-export const PLAN_LIMITS = {
-  'Free': { 
-    price: { NGN: 0, USD: 0 }, 
-    agents: 1, 
-    touchpoints: 5, 
-    leads: 15, 
-    features: ['Basic Dashboard', 'Touchpoint Branding'] 
-  },
-  'Starter': { 
-    price: { NGN: 7500, USD: 10 }, 
-    agents: 1, 
-    touchpoints: 50, 
-    leads: 100, 
-    features: ['CRM Sync', 'Lead Export (CSV)', 'WhatsApp/Email Alerts', 'No Branding'] 
-  },
-  'Growth': { 
-    price: { NGN: 20000, USD: 25 }, 
-    agents: 5, 
-    touchpoints: 500, 
-    leads: 1000, 
-    features: ['Multi-user Access', 'Automation Engine', 'Advanced Analytics', 'Routing Rules'] 
-  },
-  'Business': { 
-    price: { NGN: 50000, USD: 60 }, 
-    agents: 20, 
-    touchpoints: 1000, 
-    leads: 5000, 
-    features: ['Role-based Permissions', 'Priority Support', 'Full Pipeline Mapping'] 
-  },
-  'Enterprise': { 
-    price: { NGN: -1, USD: -1 }, 
-    agents: 100, 
-    touchpoints: 5000, 
-    leads: 100000, 
-    features: ['White-label', 'NFC Hardware Orchestration', 'Dedicated Support'] 
-  }
+export type SubscriptionStatus = 'active' | 'cancelled' | 'expired' | 'not_renewing';
+
+/**
+ * The tenant's server-authoritative billing state, as exposed by
+ * GET /v1/billing/subscription. The effective plan/status is derived
+ * server-side (resolveSubscription); the client only ever displays it.
+ */
+export interface Subscription {
+  plan: SubscriptionPlan;
+  status: SubscriptionStatus;
+  paystackCustomerCode: string | null;
+  paystackSubscriptionCode: string | null;
+  paystackPlanCode: string | null;
+  currentPeriodStart: string | null;
+  currentPeriodEnd: string | null;
+  cancelledAt: string | null;
+  expiresAt: string | null;
+  lastReference: string | null;
+}
+
+export type PlanLimits = {
+  price: { NGN: number; USD: number };
+  agents: number;
+  touchpoints: number;
+  leads: number;
+  features: string[];
 };
+
+/**
+ * PLAN_LIMITS is owned by plan-limits.js (shared with the server so the same
+ * numbers are enforced both client-side for UX and server-side as the source
+ * of truth). Re-exported here for the existing frontend consumers.
+ */
+export const PLAN_LIMITS: Record<SubscriptionPlan, PlanLimits> = PLAN_LIMITS_SOURCE;
 
 export interface Language {
   code: string;
@@ -142,3 +201,66 @@ export const SUPPORTED_CURRENCIES: Currency[] = [
   { code: 'NGN', symbol: '₦', name: 'Nigerian Naira', rate: 1450 },
   { code: 'INR', symbol: '₹', name: 'Indian Rupee', rate: 83 }
 ];
+
+export type AnalyticsRange = '24h' | '7d' | '30d' | 'all';
+
+export type AnalyticsTrendUnit = 'hour' | 'day';
+
+export interface AnalyticsTrendPoint {
+  date: string;
+  scans: number;
+  conversations: number;
+  leads: number;
+  qualifiedLeads: number;
+}
+
+export interface AnalyticsTrend {
+  unit: AnalyticsTrendUnit;
+  start: string | null;
+  end: string | null;
+  points: AnalyticsTrendPoint[];
+}
+
+export interface AnalyticsOverview {
+  range: AnalyticsRange;
+  totals: {
+    scans: number;
+    conversations: number;
+    leads: number;
+    qualifiedLeads: number;
+  };
+  deltas: {
+    scans: number | null;
+    conversations: number | null;
+    leads: number | null;
+    qualifiedLeads: number | null;
+  };
+  qualificationRate: number;
+  trends: AnalyticsTrend | null;
+}
+
+export interface TouchpointPerformance {
+  id: string;
+  name: string;
+  type: string;
+  location: string;
+  active: boolean;
+  trackingId: string;
+  agentId: string;
+  agentName: string;
+  scans: number;
+  conversations: number;
+  leads: number;
+  qualifiedLeads: number;
+  qualificationRate: number;
+}
+
+export interface AgentPerformance {
+  id: string;
+  name: string;
+  status: string;
+  conversations: number;
+  leads: number;
+  qualifiedLeads: number;
+  qualificationRate: number;
+}

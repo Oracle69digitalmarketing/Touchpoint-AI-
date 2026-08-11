@@ -1,7 +1,9 @@
 
-import React, { useState } from 'react';
-import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink, ShieldCheck } from 'lucide-react';
-import { SUPPORTED_LANGUAGES, CRMConnection, SubscriptionPlan, PLAN_LIMITS } from '../types';
+import React, { useState, useEffect } from 'react';
+import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink, ShieldCheck, RefreshCw } from 'lucide-react';
+import { SUPPORTED_LANGUAGES, CRMConnection, SubscriptionPlan, Subscription, PLAN_LIMITS } from '../types';
+import { getAuthHeaders } from '../services/auth';
+import { billingService } from '../services/billing';
 
 interface Props {
   currentLanguage: string;
@@ -29,6 +31,9 @@ const Settings: React.FC<Props> = ({
   const [isSubModalOpen, setIsSubModalOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const [deleteKeyword, setDeleteKeyword] = useState('');
+  const [processingPlan, setProcessingPlan] = useState<SubscriptionPlan | null>(null);
+  const [subError, setSubError] = useState('');
+  const [subscriptionDetail, setSubscriptionDetail] = useState<Subscription | null>(null);
 
   // Identity Verification State
   const [banks, setBanks] = useState<{name: string, code: string}[]>([]);
@@ -39,7 +44,7 @@ const Settings: React.FC<Props> = ({
 
   const fetchBanks = async () => {
     try {
-      const res = await fetch(`${window.location.origin.includes('localhost:3000') ? 'http://localhost:3001/v1' : '/v1'}/identity/banks`);
+      const res = await fetch(`/v1/identity/banks`, { headers: getAuthHeaders() });
       const data = await res.json();
       if (data.status) setBanks(data.data);
     } catch (e) { console.error("Bank fetch failed"); }
@@ -50,7 +55,7 @@ const Settings: React.FC<Props> = ({
     setResolvingAccount(true);
     setVerifiedData(null);
     try {
-      const res = await fetch(`${window.location.origin.includes('localhost:3000') ? 'http://localhost:3001/v1' : '/v1'}/identity/resolve-account?account_number=${accountNumber}&bank_code=${selectedBank}`);
+      const res = await fetch(`/v1/identity/resolve-account?account_number=${accountNumber}&bank_code=${selectedBank}`, { headers: getAuthHeaders() });
       const data = await res.json();
       if (data.status) setVerifiedData(data.data);
       else alert(data.message || "Could not verify account");
@@ -73,7 +78,7 @@ const Settings: React.FC<Props> = ({
     };
   });
 
-  const handlePaystackPayment = (planName: SubscriptionPlan, amount: number) => {
+  const handlePaystackPayment = async (planName: SubscriptionPlan, amount: number) => {
     if (amount === -1) {
       // Redirect to WhatsApp for Enterprise leads
       const phoneNumber = "23439271978"; // REPLACE WITH YOUR REAL NUMBER
@@ -82,29 +87,75 @@ const Settings: React.FC<Props> = ({
       return;
     }
 
-    if (amount <= 0) {
-      setSubscription(planName);
-      setIsSubModalOpen(false);
-      return;
-    }
+    setSubError('');
+    setProcessingPlan(planName);
 
-    const handler = (window as any).PaystackPop.setup({
-      key: (import.meta as any).env.VITE_PAYSTACK_PUBLIC_KEY || process.env.PAYSTACK_PUBLIC_KEY,
-      email: 'customer@example.com', // In a real app, use the logged-in user's email
-      amount: amount * 100, // Paystack expects amount in kobo or cents
-      currency: currentCurrency === 'NGN' ? 'NGN' : 'USD',
-      callback: (response: any) => {
-        console.log('Payment successful', response);
-        setSubscription(planName);
+    try {
+      // The server alone decides the price, currency, reference and tenant. The
+      // client only tells it which plan it wants and then opens the checkout
+      // URL the server created.
+      const result = await billingService.initialize(planName, currentCurrency);
+
+      if (planName === 'Free' || amount <= 0) {
+        // Server-side downgrade: no Paystack checkout involved.
+        setSubscription(result.plan);
+        setSubscriptionDetail(result.subscription || null);
         setIsSubModalOpen(false);
-        alert(`Success! You have been upgraded to the ${planName} tier.`);
-      },
-      onClose: () => {
-        console.log('Window closed');
+        alert(`You are now on the ${result.plan} tier.`);
+        return;
       }
-    });
-    handler.openIframe();
+
+      // Hosted checkout: Paystack redirects back to /settings?reference=...,
+      // where the effect below verifies the charge server-side.
+      window.location.assign(result.authorizationUrl);
+    } catch (err: any) {
+      setSubError(err.message || 'Could not start checkout. Please try again.');
+    } finally {
+      setProcessingPlan(null);
+    }
   };
+
+  // Refresh the server-authoritative subscription and reconcile any checkout
+  // redirect (Paystack sends us back to /settings?reference=...).
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const current = await billingService.subscription();
+        if (!cancelled) setSubscriptionDetail(current);
+      } catch (err) {
+        // The workspace may still be hydrating auth state; the next fetch retries.
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const reference = params.get('reference');
+    if (!reference) return;
+
+    const verify = async () => {
+      try {
+        const result = await billingService.verify(reference);
+        setSubscription(result.subscription.plan);
+        setSubscriptionDetail(result.subscription);
+        setIsSubModalOpen(false);
+        alert(
+          result.transaction.status === 'success'
+            ? `Payment confirmed! You are now on the ${result.subscription.plan} tier.`
+            : 'Your payment could not be confirmed. If you were charged, contact support.'
+        );
+      } catch (err: any) {
+        alert(err.message || 'Could not confirm your payment.');
+      } finally {
+        // Clear the checkout params so reloads don't re-verify the reference.
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    };
+    verify();
+  }, [subscription]);
 
   const handleCrmClick = (crm: CRMConnection) => {
     if (crm.status === 'connected') {
@@ -297,6 +348,16 @@ const Settings: React.FC<Props> = ({
                   <li className="flex justify-between"><span>Agents</span> <span className="text-white">{PLAN_LIMITS[subscription].agents}</span></li>
                   <li className="flex justify-between"><span>Nodes</span> <span className="text-white">{PLAN_LIMITS[subscription].touchpoints}</span></li>
                </ul>
+               {subscriptionDetail && subscriptionDetail.status !== 'active' && (
+                 <p className={`mt-4 text-[10px] font-black uppercase tracking-widest ${subscriptionDetail.status === 'expired' ? 'text-rose-400' : 'text-amber-400'}`}>
+                   {subscriptionDetail.status}
+                 </p>
+               )}
+               {subscriptionDetail && subscriptionDetail.currentPeriodEnd && subscription !== 'Free' && (
+                 <p className="mt-2 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+                   Renews {new Date(subscriptionDetail.currentPeriodEnd).toLocaleDateString()}
+                 </p>
+               )}
             </div>
             <button 
               onClick={() => setIsSubModalOpen(true)}
@@ -355,13 +416,14 @@ const Settings: React.FC<Props> = ({
                     </ul>
                     <button 
                       onClick={() => handlePaystackPayment(plan.name, plan.amount)}
-                      disabled={subscription === plan.name}
-                      className={`w-full py-3 rounded-xl font-bold text-sm transition-all ${
+                      disabled={subscription === plan.name || processingPlan !== null}
+                      className={`w-full py-3 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 ${
                         subscription === plan.name 
                           ? 'bg-indigo-600 text-white shadow-lg' 
-                          : 'bg-white border border-slate-200 text-slate-900 hover:bg-slate-900 hover:text-white'
+                          : 'bg-white border border-slate-200 text-slate-900 hover:bg-slate-900 hover:text-white disabled:opacity-50'
                       }`}
                     >
+                      {processingPlan === plan.name && <Loader2 size={14} className="animate-spin" />}
                       {subscription === plan.name ? 'Current Active Plan' : plan.amount === -1 ? 'Contact Sales' : `Upgrade to ${plan.name}`}
                     </button>
                   </div>
@@ -381,6 +443,39 @@ const Settings: React.FC<Props> = ({
                   Billing Docs <ExternalLink size={14} />
                 </a>
               </div>
+              {subError && (
+                <div className="mt-6 p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-700 text-xs font-bold flex items-center gap-2">
+                  <AlertTriangle size={14} /> {subError}
+                </div>
+              )}
+              {subscription !== 'Free' && (
+                <div className="mt-6 p-6 bg-slate-50 rounded-[32px] border border-slate-100 flex items-center justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 bg-white border border-slate-200 rounded-2xl flex items-center justify-center text-slate-400">
+                      <RefreshCw size={24} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-slate-900">Manage current plan</p>
+                      <p className="text-xs text-slate-400">Cancel renewals — access continues until the current period ends.</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      if (!confirm('Cancel your subscription? Access stays active until the current period ends.')) return;
+                      try {
+                        const updated = await billingService.cancel();
+                        setSubscriptionDetail(updated);
+                        alert('Subscription cancelled. You keep access until the end of the current period.');
+                      } catch (err: any) {
+                        alert(err.message || 'Could not cancel the subscription.');
+                      }
+                    }}
+                    className="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-900 hover:text-white transition-all"
+                  >
+                    Cancel Subscription
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

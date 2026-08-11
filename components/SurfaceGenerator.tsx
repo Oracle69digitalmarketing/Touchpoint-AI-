@@ -1,32 +1,48 @@
 
-import React, { useState } from 'react';
-import { Smartphone, Download, Copy, QrCode, Rocket, Info, Loader2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Smartphone, Download, Copy, QrCode, Rocket, Info, Loader2, AlertTriangle } from 'lucide-react';
 import { SurfaceType, Agent, Touchpoint } from '../types';
+import { TouchpointInput } from '../services/workspace';
 import QRCode from 'qrcode';
 
 interface Props {
   agents: Agent[];
-  onDeploy: (tp: Touchpoint) => void;
+  onDeploy: (input: TouchpointInput) => Promise<Touchpoint>;
+  onNavigate?: (tab: string) => void;
 }
 
-const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy }) => {
+const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy, onNavigate }) => {
   const [type, setType] = useState<SurfaceType>(SurfaceType.BUSINESS_CARD);
   const [selectedAgentId, setSelectedAgentId] = useState(agents[0]?.id || '');
   const [name, setName] = useState('');
   const [location, setLocation] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
-  const [result, setResult] = useState<{qr: string, url: string} | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{qr: string, url: string, trackingId: string} | null>(null);
+
+  // Keep the assigned agent in sync once persisted agents finish loading.
+  useEffect(() => {
+    if (!selectedAgentId && agents.length > 0) {
+      setSelectedAgentId(agents[0].id);
+    }
+  }, [agents, selectedAgentId]);
 
   const generate = async () => {
     if (!selectedAgentId || !name) return;
     setIsGenerating(true);
+    setError(null);
     
     try {
-      const trackingId = `TX-${Math.floor(Math.random() * 9000) + 1000}`;
-      const url = `https://touchpoint.ai/active/${trackingId}`;
-      
-      // LOCAL GENERATION: No tracking URL ever leaves the client.
-      // Generates a high-quality Base64 Data URI.
+      // Persist the touchpoint server-side: the backend assigns the tracking id
+      // and returns the authoritative public destination URL.
+      const touchpoint = await onDeploy({
+        name: name.trim(),
+        type,
+        agentId: selectedAgentId,
+        location: location.trim() || 'Unknown',
+      });
+
+      const url = touchpoint.url || '';
       const qrBase64 = await QRCode.toDataURL(url, {
         width: 600,
         margin: 2,
@@ -38,28 +54,15 @@ const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy }) => {
 
       setResult({
         qr: qrBase64,
-        url: url
+        url: url,
+        trackingId: touchpoint.trackingId,
       });
-    } catch (err) {
-      console.error("QR Generation Error:", err);
+    } catch (err: any) {
+      setError(err.message || 'Could not generate touchpoint.');
+      console.error("Touchpoint Generation Error:", err);
     } finally {
       setIsGenerating(false);
     }
-  };
-
-  const handleDeploy = () => {
-    if (!result) return;
-    const newTp: Touchpoint = {
-      id: Math.random().toString(36).substr(2, 9),
-      name: name || 'New Surface',
-      type,
-      agentId: selectedAgentId,
-      scans: 0,
-      active: true,
-      location: location || 'Unknown',
-      trackingId: result.url.split('/').pop() || ''
-    };
-    onDeploy(newTp);
   };
 
   const downloadQR = () => {
@@ -132,8 +135,15 @@ const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy }) => {
             className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all active:scale-95 disabled:opacity-30 flex items-center justify-center gap-2"
           >
             {isGenerating ? <Loader2 size={18} className="animate-spin" /> : <Rocket size={18} />}
-            {isGenerating ? 'Compiling Local Asset...' : 'Generate Touchpoint Assets'}
+            {isGenerating ? 'Provisioning Node...' : 'Generate Touchpoint Assets'}
           </button>
+
+          {error && (
+            <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-xs font-bold flex items-center gap-2">
+              <AlertTriangle size={14} />
+              {error}
+            </div>
+          )}
         </div>
 
         <div className="bg-white p-8 rounded-[32px] border border-slate-100 shadow-sm flex flex-col items-center justify-center min-h-[440px]">
@@ -147,11 +157,19 @@ const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy }) => {
                </div>
 
                <div className="space-y-4">
-                  <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1">
-                      <Info size={10} /> Privacy-Locked Tracking Link
-                    </p>
-                    <p className="text-sm font-mono truncate text-indigo-600">{result.url}</p>
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 space-y-2">
+                    <div>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                        <Info size={10} /> Server-Assigned Tracking ID
+                      </p>
+                      <p className="text-sm font-mono text-indigo-600">{result.trackingId}</p>
+                    </div>
+                    <div className="border-t border-slate-200/60 pt-2">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                        <Info size={10} /> Privacy-Locked Destination
+                      </p>
+                      <p className="text-sm font-mono truncate text-slate-700">{result.url}</p>
+                    </div>
                   </div>
                   <div className="flex gap-3">
                     <button 
@@ -161,10 +179,10 @@ const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy }) => {
                       <Download size={16}/> PNG
                     </button>
                     <button 
-                      onClick={handleDeploy}
+                      onClick={() => onNavigate && onNavigate('touchpoints')}
                       className="flex-1 flex items-center justify-center gap-2 py-3 bg-emerald-600 text-white rounded-xl font-bold text-sm hover:bg-emerald-700 transition-all"
                     >
-                      <Rocket size={16}/> Activate Live
+                      <Rocket size={16}/> Live in Matrix
                     </button>
                   </div>
                </div>

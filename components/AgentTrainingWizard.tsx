@@ -1,11 +1,13 @@
 
 import React, { useState, useRef } from 'react';
 import { Bot, FileText, Users, Award, Mic, CheckCircle, ArrowRight, Sparkles, Upload, X, File, Loader2, Zap } from 'lucide-react';
-import { AgentStatus } from '../types';
+import { Agent } from '../types';
+import { AgentInput } from '../services/workspace';
 
 interface WizardProps {
-  onComplete: (data: any) => void;
+  onComplete: (data: AgentInput) => void;
   onCancel: () => void;
+  agent?: Agent | null;
 }
 
 const STEPS = [
@@ -17,37 +19,34 @@ const STEPS = [
   { id: 'review', title: 'Review', icon: CheckCircle },
 ];
 
-const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel }) => {
+const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agent }) => {
   const [currentStep, setCurrentStep] = useState(0);
   const [isTraining, setIsTraining] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const isEditing = Boolean(agent);
   
-  const [formData, setFormData] = useState({
-    name: '',
-    industry: 'Real Estate',
-    description: '',
-    serviceCatalog: '',
-    clientProfiles: '',
-    caseLibrary: '',
-    voice: 'professional',
-    guidelines: '',
-    documents: [] as string[]
-  });
+  const [formData, setFormData] = useState<AgentInput>(() => ({
+    name: agent?.name || '',
+    industry: agent?.industry || 'Real Estate',
+    description: agent?.description || '',
+    serviceCatalog: agent?.serviceCatalog || '',
+    clientProfiles: agent?.clientProfiles || '',
+    caseLibrary: agent?.caseLibrary || '',
+    voice: agent?.voice || 'professional',
+    guidelines: agent?.guidelines || '',
+    documents: agent?.documents || []
+  }));
 
   const nextStep = () => setCurrentStep(prev => Math.min(prev + 1, STEPS.length - 1));
   const prevStep = () => setCurrentStep(prev => Math.max(prev - 1, 0));
 
   const handleFinish = () => {
     setIsTraining(true);
+    // The server owns the id, status, and stats. This timeout only preserves the
+    // "deploying" animation before persisting through the API.
     setTimeout(() => {
-      onComplete({
-        ...formData,
-        id: Math.random().toString(36).substr(2, 9),
-        status: AgentStatus.ACTIVE,
-        leadsGenerated: 0,
-        conversionRate: 0
-      });
+      onComplete({ ...formData, name: formData.name.trim() });
       setIsTraining(false);
     }, 2500);
   };
@@ -245,8 +244,8 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel }) =>
       <div className="bg-white w-full max-w-2xl rounded-[48px] overflow-hidden shadow-2xl flex flex-col h-full max-h-[85vh] animate-in zoom-in duration-300">
         <div className="p-10 border-b border-slate-100 flex items-center justify-between">
           <div>
-            <h2 className="text-3xl font-bold text-slate-900 tracking-tight">Agent Training</h2>
-            <p className="text-slate-500 font-medium mt-1">Provisioning intelligence layer for your workforce</p>
+            <h2 className="text-3xl font-bold text-slate-900 tracking-tight">{isEditing ? 'Edit Agent' : 'Agent Training'}</h2>
+            <p className="text-slate-500 font-medium mt-1">{isEditing ? 'Refine the intelligence layer for your workforce' : 'Provisioning intelligence layer for your workforce'}</p>
           </div>
           <button onClick={onCancel} className="p-3 hover:bg-slate-50 rounded-2xl text-slate-400 hover:text-slate-900 transition-all"><X size={24} /></button>
         </div>
@@ -297,7 +296,7 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel }) =>
                 className="flex items-center gap-2 px-10 py-4 bg-indigo-600 text-white rounded-2xl font-bold hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all active:scale-95 disabled:opacity-50"
               >
                 {isTraining ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
-                {isTraining ? 'Deploying...' : 'Finalize & Deploy'}
+                {isTraining ? 'Saving...' : isEditing ? 'Save Changes' : 'Finalize & Deploy'}
               </button>
             )}
           </div>

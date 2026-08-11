@@ -1,326 +1,216 @@
-Touchpoint AI - Conversational Infrastructure for Physical Commerce
+# Touchpoint AI — Conversational Infrastructure for Physical Commerce
 
-https://img.shields.io/badge/Node.js-18+-green.svg
-https://img.shields.io/badge/TypeScript-5.0-blue.svg
-https://img.shields.io/badge/Next.js-14-black.svg
-https://img.shields.io/badge/PostgreSQL-15-blue.svg
-https://img.shields.io/badge/Redis-7-red.svg
-https://img.shields.io/badge/Prisma-5-purple.svg
-https://img.shields.io/badge/OpenAI-GPT--4-green.svg
-https://img.shields.io/badge/License-MIT-yellow.svg
+> Made with ❤️ in Nigeria | Building the future of physical commerce
 
 🚀 Transform Physical Marketing into AI-Driven Revenue
 
-Touchpoint AI converts any physical marketing surface—business cards, flyers, signage, packaging—into intelligent, 24/7 conversational sales channels. Embed custom AI agents behind QR codes/NFC chips to engage prospects, qualify leads, and book meetings automatically.
+Touchpoint AI converts any physical marketing surface — business cards, flyers,
+posters, signage, NFC tags — into intelligent, 24/7 conversational sales
+channels. Embed custom AI agents behind QR codes/NFC chips to engage prospects,
+qualify leads, and track conversions per surface.
 
-✨ Key Features
+## ✨ Key Features
 
-· 🤖 Custom AI Agents: Train business-specific AI that knows your services, pricing, and brand voice
-· 🔗 Multi-Channel Activation: WhatsApp, SMS, USSD, Web Chat, NFC - one agent adapts to any device
-· 📱 Smart Routing: Automatically detects device capabilities and serves optimal interface
-· 🎯 Conversational Sales Flow: Full-cycle AI conversations from engagement to conversion
-· 📊 Analytics Dashboard: Track scans, conversations, qualified leads, and ROI per surface
-· 🔄 CRM Integration: Native sync with HubSpot, Salesforce, Zoho, and custom webhooks
-· 🖨️ Production Network: Order physical surfaces (cards, flyers, NFC) directly from platform
-· 💰 Proposal Generation: AI-powered professional proposals based on conversation context
+- **Custom AI Agents** — business-specific agents with your services, pricing, and brand voice
+- **Smart Physical Touchpoints** — QR/NFC surfaces with server-generated tracking links
+- **Public Conversational Chat** — customers scan a code and chat without an account
+- **Automatic Lead Capture & Qualification** — server-side deterministic scoring
+- **Lead Notifications** — in-app alerts for newly qualified leads
+- **Analytics Dashboard** — real scans, conversations, leads, and qualification rates per touchpoint/agent
+- **Paystack Billing** — server-authoritative subscriptions, one-time or recurring
+- **Identity Verification** — Paystack-backed account/BVN/bank resolution
+- **CRM Connections** — tenant-scoped CRM handshake scaffolding
 
-🏗️ Architecture
+## 🏗️ Architecture
+
+A **single Express monolith**: one Node.js process serves the API, the
+authenticated owner dashboard, and the public customer chat. The frontend is
+Vite + React (two entry points), and all data lives in one SQLite database.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Frontend (Next.js 14)                │
-├─────────────────────────────────────────────────────────┤
-│          API Gateway (Express.js/Next.js API)           │
-├─────────────────────────────────────────────────────────┤
-│     Services Layer (Microservices Architecture)         │
-│  ├────────────┬────────────┬────────────┬─────────────┤
-│  │   AI Service│  Channel   │ Analytics  │   Payment   │
-│  │            │   Service   │  Service   │   Service   │
-│  └────────────┴────────────┴────────────┴─────────────┤
-├─────────────────────────────────────────────────────────┤
-│         Database Layer (PostgreSQL + Redis)            │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                 Express.js server (server.js)                 │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Serves dist/ (Vite build) — dashboard + public chat   │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  API (/v1) — auth, agents, touchpoints, conversations, │  │
+│  │  leads, analytics, billing, identity, crm, ai          │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  SQLite (better-sqlite3, WAL) — all tenant data        │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-🛠️ Tech Stack
+- Frontend build: `index.html` (owner dashboard) + `t.html` (public chat)
+- Vite dev server (port 3000) proxies `/v1` and `/t` to Express
+- Production: `yarn build` then `node server.js` — Express serves both the API and the built UI
 
-Backend:
+## 🛠️ Tech Stack
 
-· Node.js 18+ with Express.js/TypeScript
-· PostgreSQL 15+ with Prisma ORM
-· Redis 7+ for caching and queues
-· OpenAI GPT-4 API + LangChain
-· Twilio API (WhatsApp/SMS)
-· Paystack/Stripe for payments
-· Docker & Docker Compose
+| Layer | Choice |
+|---|---|
+| Runtime | Node.js ≥ 20 |
+| Server | Express 4 |
+| Frontend | Vite + React 18 + Tailwind |
+| Database | SQLite via better-sqlite3 (WAL mode) |
+| AI | Groq (server-side only) |
+| Payments | Paystack (server-authoritative) |
+| Auth | JWT + server-side sessions + bcrypt |
 
-Frontend:
+No Redis, no PostgreSQL, no Docker requirement, no microservices — the
+application is intentionally a single deployable process with a single file
+database.
 
-· Next.js 14 with App Router
-· TypeScript
-· Tailwind CSS + Shadcn/ui
-· React Query + Zustand
-· Recharts for visualizations
-· React Hook Form + Zod validation
+## 🚀 Quick Start
 
-🚀 Quick Start
-
-Prerequisites
-
-· Node.js 18+
-· PostgreSQL 15+
-· Redis 7+
-· Docker (optional)
-· OpenAI API key
-· Twilio account (for WhatsApp/SMS)
-
-Installation
-
-1. Clone the repository
+Prerequisites: Node.js ≥ 20, yarn.
 
 ```bash
-git clone https://github.com/touchpoint-ai/touchpoint-ai.git
-cd touchpoint-ai
+yarn install
+cp .env.example .env        # then fill in JWT_SECRET, GROQ_API_KEY, PAYSTACK_SECRET_KEY
+yarn dev                     # Vite on http://localhost:3000, Express on :3001
 ```
 
-1. Set up environment variables
+Run the server + full test suite:
 
 ```bash
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env.local
-# Edit both files with your API keys
+yarn server                  # Express alone on :3001
+yarn test                    # all phase smoke tests (isolated temp DBs)
+yarn build                   # typecheck + production build into dist/
 ```
 
-1. Start with Docker (recommended)
+## 🌐 Environment Variables
+
+See `.env.example` for the complete annotated list. Key variables:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `JWT_SECRET` | always | ≥32 chars and non-placeholder in production |
+| `GROQ_API_KEY` | production | server-side only |
+| `PAYSTACK_SECRET_KEY` | production | server-side only; webhook signatures |
+| `APP_URL` | production | http(s) URL, used for touchpoint links + callback |
+| `CORS_ORIGIN` | production | browser origin(s); localhost rejected in prod |
+| `PORT` | no | default 3001 |
+| `DATA_DIR` | no | SQLite location, default `./data` |
+| `TRUST_PROXY` | no | set only behind a reverse proxy |
+| `VITE_PAYSTACK_PUBLIC_KEY` | client | the only key that ships to the browser |
+
+## 🚚 Production Deployment
+
+The application deploys as one process. The recommended flow:
 
 ```bash
-docker-compose up -d
+# 1. Validate the environment (fails fast on missing/misconfigured vars)
+node scripts/check-env.js
+
+# 2. Install, then build the frontend and verify no secrets leak into dist/
+yarn install
+yarn build:prod
+
+# 3. Start
+NODE_ENV=production yarn start
 ```
 
-1. Or run manually
+Suggested architecture behind a TLS-terminating reverse proxy:
+
+```
+Internet → nginx/Caddy (TLS) → localhost:3001 (this app)
+```
+
+Set `TRUST_PROXY=1` so rate limiting and redirects see the real client IP.
+Point your load balancer's health check at `/v1/health` — it performs a live
+SQLite round-trip and returns `503` when the database is unreachable. The
+health endpoint is exempt from the general API rate limit so health checks can
+never be throttled.
+
+### Render deployment (recommended)
+
+A `render.yaml` blueprint is included in the repository. It deploys the exact
+same Express monolith — no new architecture, no Docker, no external database.
+
+**One-time setup on Render:**
+
+1. **Create a Web Service** from this repository (or use the Blueprint via
+   "New → Blueprint" pointing at `render.yaml`). The blueprint configures:
+   - **Build command:** `npm run build:prod` (typecheck → Vite build → secret-leak scan)
+   - **Start command:** `npm run start:prod` (`NODE_ENV=production node server.js`)
+   - **Health check path:** `/v1/health`
+   - **Persistent Disk:** mounted at `/data` (SQLite lives at `/data/touchpoint.db`)
+2. **Add a Persistent Disk** (mount path `/data`, ≥ 1 GB) so the database
+   survives restarts and redeploys. The database initializes itself on first
+   boot against the empty disk — no manual migration step.
+3. **Set environment variables** (never in `render.yaml`, never in git):
+
+| Variable | Required | Value |
+|---|---|---|
+| `GROQ_API_KEY` | yes | from https://console.groq.com/ |
+| `PAYSTACK_SECRET_KEY` | yes | Paystack dashboard; also verifies webhooks |
+| `APP_URL` | yes | `https://<your-app>.onrender.com` (no trailing slash) |
+| `CORS_ORIGIN` | yes | same origin as `APP_URL` (comma-separate extras) |
+| `VITE_PAYSTACK_PUBLIC_KEY` | yes | must exist at **build** time |
+| `JWT_SECRET` | auto | Render generates it via `generateValue` |
+
+   `PORT` is injected by Render — do not set it. `NODE_ENV=production`,
+   `DATA_DIR=/data` and `TRUST_PROXY=1` are set by the blueprint.
+
+4. **Paystack webhook:** set the endpoint in the Paystack dashboard to
+   `https://<your-app>.onrender.com/v1/billing/webhook`. It is HMAC-verified
+   with `PAYSTACK_SECRET_KEY` and does not require a user session.
+5. **Backups:** the same disk is used by `node scripts/backup.js`, which writes
+   consistent copies to `<DATA_DIR>/backups` (14-backup retention). Run it on a
+   schedule (e.g. Render Cron Job: `node scripts/backup.js`).
+
+### Graceful shutdown
+
+`SIGTERM`/`SIGINT` stop accepting connections, checkpoint the SQLite WAL, and
+close the database cleanly before exiting. Safe to restart on every deploy.
+
+### SQLite production data handling
+
+- WAL + `synchronous=NORMAL`, `busy_timeout`, and a memory page cache are set at startup
+- Startup integrity check in production (disable with `DB_SKIP_INTEGRITY_CHECK=1`)
+- `./data` is locked to `0700`, the database file to `0600`
+- Online backups while the server runs, with 14-backup retention:
 
 ```bash
-# Backend
-cd backend
-npm install
-npx prisma migrate dev
-npx prisma generate
-npm run dev
-
-# Frontend (in new terminal)
-cd frontend
-npm install
-npm run dev
+yarn backup                       # writes ./data/backups/touchpoint-<timestamp>.db
+BACKUP_DIR=/secure/path yarn backup   # or anywhere you like
 ```
 
-1. Access the application
+## 🛡️ Security Hardening
 
-· Frontend: http://localhost:3000
-· Backend API: http://localhost:5000
-· API Documentation: http://localhost:5000/api/docs
-· Prisma Studio: http://localhost:5555
+- Server-authoritative Paystack billing: the client never sets an amount, currency,
+  plan, or reference, and entitlement is granted only by the signed webhook or a
+  server-side verification against recorded values
+- Webhook signature verification (HMAC-SHA512 over the raw body, constant-time)
+- Server-side sessions — logout revokes immediately
+- Per-IP rate limiting (API, AI, auth, public chat)
+- Helmet headers, `Permissions-Policy`, `X-Powered-By` disabled
+- Tenant isolation everywhere — the business id always comes from the session
+- Secrets never enter the client bundle; `build:prod` fails if secret-shaped
+  material appears in `dist/` (`node scripts/verify-dist.js` to re-check)
 
-📁 Project Structure
+## 🧪 Testing
 
-```
-touchpoint-ai/
-├── backend/                 # Express.js API server
-│   ├── src/
-│   │   ├── config/         # Configuration files
-│   │   ├── controllers/    # Route controllers
-│   │   ├── middleware/     # Custom middleware
-│   │   ├── models/         # Database models (Prisma)
-│   │   ├── routes/         # API routes
-│   │   ├── services/       # Business logic
-│   │   └── utils/          # Utility functions
-│   ├── prisma/             # Prisma schema and migrations
-│   └── tests/              # Test files
-├── frontend/               # Next.js 14 application
-│   ├── app/                # Next.js app router pages
-│   ├── components/         # React components
-│   │   ├── ui/            # Reusable UI components
-│   │   ├── dashboard/     # Dashboard components
-│   │   └── forms/         # Form components
-│   ├── lib/               # Utility libraries
-│   └── types/             # TypeScript definitions
-├── shared/                 # Shared types and utilities
-├── infrastructure/         # Deployment configurations
-├── docker-compose.yml      # Docker orchestration
-└── README.md               # This file
-```
-
-🎯 Usage Examples
-
-1. Create an AI Agent
-
-```javascript
-const agent = await api.trainAgent({
-  name: "Real Estate Assistant",
-  brandVoice: "professional",
-  serviceCatalog: "Property tours, financing assistance...",
-  clientProfiles: "First-time buyers, ages 25-40...",
-  conversionWorkflows: "Tour booking → Qualification → Proposal"
-});
-```
-
-2. Generate Marketing Surface
-
-```javascript
-const surface = await api.generateSurface({
-  type: "business-card",
-  design: { logo: "...", colors: "#2563eb" },
-  agentId: "agent_123",
-  quantity: 100
-});
-```
-
-3. Handle Conversation
-
-```javascript
-// Webhook handler for WhatsApp
-app.post('/webhooks/whatsapp', async (req, res) => {
-  const { From, Body } = req.body;
-  const response = await aiService.handleConversation(agentId, Body);
-  await channelService.sendWhatsAppMessage(From, response.message);
-});
-```
-
-📊 API Reference
-
-Authentication
-
-```http
-POST /api/auth/register
-POST /api/auth/login
-POST /api/auth/refresh
-```
-
-Agents
-
-```http
-POST /api/agents          # Create agent
-GET  /api/agents          # List agents
-POST /api/agents/{id}/train  # Train agent
-POST /api/agents/{id}/test   # Test agent
-```
-
-Surfaces
-
-```http
-POST /api/surfaces        # Create surface
-GET  /api/surfaces        # List surfaces
-POST /api/surfaces/{id}/order  # Order physical
-```
-
-Webhooks
-
-```http
-POST /api/webhooks/whatsapp  # WhatsApp messages
-POST /api/webhooks/sms       # SMS messages
-POST /api/webhooks/payment   # Payment notifications
-```
-
-Complete API documentation available at /api/docs when running locally.
-
-🧪 Testing
+All suites are smoke tests over the real Express app with isolated temp
+databases and faked Groq/Paystack clients — no live API keys or network needed.
 
 ```bash
-# Run backend tests
-cd backend
-npm test
-
-# Run frontend tests
-cd frontend
-npm test
-
-# Run E2E tests
-npm run test:e2e
+yarn test            # phase2..phase8 + deployment smoke tests
+NODE_ENV=test node --test tests/phase7-billing.test.js   # single suite
 ```
 
-🐳 Docker Deployment
+Coverage includes auth/session/timing, tenant isolation, agent & touchpoint
+CRUD, public chat + scan recording, lead qualification + limits, analytics
+accuracy, Paystack billing + webhook idempotency, and Phase 8 production
+hardening (env validation, DB pragmas, security headers, secret-leak scan). The
+deployment smoke suite (`tests/phase8-deploy.test.js`) exercises the exact
+behaviors a Render deployment depends on: health endpoint, SPA serving, public
+`/t/:trackingId`, unauthenticated 401s, webhook reachability, CORS, request
+size/parse errors, fresh-disk database initialization and the dist secret scan.
 
-```bash
-# Build and run
-docker-compose up -d --build
+## 📄 License
 
-# View logs
-docker-compose logs -f
-
-# Run migrations
-docker-compose exec backend npx prisma migrate deploy
-
-# Access services
-# App: http://localhost:3000
-# API: http://localhost:5000
-# DB: localhost:5432
-# Redis: localhost:6379
-```
-
-🌐 Environment Variables
-
-Key environment variables:
-
-```env
-# Database
-DATABASE_URL="postgresql://user:pass@localhost:5432/touchpoint"
-REDIS_URL="redis://localhost:6379"
-
-# Authentication
-JWT_SECRET="your-jwt-secret"
-
-# AI Services
-OPENAI_API_KEY="sk-..."
-
-# Communication
-TWILIO_ACCOUNT_SID="AC..."
-TWILIO_AUTH_TOKEN="..."
-
-# Payments
-PAYSTACK_PUBLIC_KEY="pk_..."
-PAYSTACK_SECRET_KEY="sk_..."
-```
-
-See .env.example files for complete list.
-
-🤝 Contributing
-
-We welcome contributions! Please see our Contributing Guidelines for details.
-
-1. Fork the repository
-2. Create a feature branch (git checkout -b feature/amazing-feature)
-3. Commit changes (git commit -m 'Add amazing feature')
-4. Push to branch (git push origin feature/amazing-feature)
-5. Open a Pull Request
-
-📈 Roadmap
-
-· MVP: WhatsApp + QR Code integration
-· Multi-agent support
-· USSD channel integration (Q1 2026)
-· NFC support (Q1 2026)
-· Mobile app (Q2 2026)
-· White-label platform (Q3 2026)
-· International expansion (Q4 2026)
-
-📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-📞 Contact & Support
-
-· Website: https://touchpoint.ai
-· Email: support@touchpoint.ai
-· LinkedIn: Touchpoint AI
-· Twitter: @touchpoint_ai
-
-🙏 Acknowledgments
-
-· OpenAI for GPT-4 API
-· Twilio for WhatsApp/SMS infrastructure
-· Prisma for amazing ORM
-· Next.js team for incredible React framework
-· All our beta customers for valuable feedback
-
----
-
-Made with ❤️ in Nigeria | Building the future of physical commerce
+MIT — see the LICENSE file.

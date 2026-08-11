@@ -1,7 +1,7 @@
 
 import React, { useState } from 'react';
-import { LayoutDashboard, Bot, QrCode, MessageSquare, Settings as SettingsIcon, Bell, ChevronDown, Coins, HelpCircle } from 'lucide-react';
-import { SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES, SubscriptionPlan, PLAN_LIMITS } from '../types';
+import { LayoutDashboard, Bot, QrCode, MessageSquare, Settings as SettingsIcon, Bell, ChevronDown, Coins, HelpCircle, LogOut, CheckCheck, User } from 'lucide-react';
+import { SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES, SubscriptionPlan, PLAN_LIMITS, LeadNotification } from '../types';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -13,6 +13,11 @@ interface LayoutProps {
   onCurrencyChange: (currency: string) => void;
   subscription: SubscriptionPlan;
   usage: { agents: number; touchpoints: number };
+  notifications: LeadNotification[];
+  unreadNotifications: number;
+  onReadNotifications: () => void;
+  businessName: string;
+  onLogout: () => void;
 }
 
 const Layout: React.FC<LayoutProps> = ({ 
@@ -24,10 +29,16 @@ const Layout: React.FC<LayoutProps> = ({
   currentCurrency,
   onCurrencyChange,
   subscription,
-  usage
+  usage,
+  notifications = [],
+  unreadNotifications = 0,
+  onReadNotifications,
+  businessName,
+  onLogout
 }) => {
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
   const [isCurrencyMenuOpen, setIsCurrencyMenuOpen] = useState(false);
+  const [isNotifOpen, setIsNotifOpen] = useState(false);
   
   const navItems = [
     { id: 'dashboard', label: 'Pulse', icon: LayoutDashboard },
@@ -102,9 +113,65 @@ const Layout: React.FC<LayoutProps> = ({
             <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em]">
               Node Control & Logic Plane
             </h2>
+            <p className="text-sm font-black text-slate-900 tracking-tight mt-0.5">{businessName}</p>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-4">
+            {/* In-app notifications for newly qualified leads */}
+            <div className="relative">
+              <button
+                onClick={() => { setIsNotifOpen(!isNotifOpen); setIsCurrencyMenuOpen(false); setIsLangMenuOpen(false); }}
+                title="New qualified leads"
+                className="relative w-10 h-10 rounded-2xl border border-slate-200 bg-slate-50 text-slate-400 hover:text-indigo-600 hover:border-indigo-200 transition-all flex items-center justify-center"
+              >
+                <Bell size={16} />
+                {unreadNotifications > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-rose-500 text-white text-[9px] font-black rounded-full flex items-center justify-center border-2 border-white">
+                    {unreadNotifications > 99 ? '99+' : unreadNotifications}
+                  </span>
+                )}
+              </button>
+              {isNotifOpen && (
+                <div className="absolute right-0 mt-3 w-80 bg-white border border-slate-100 rounded-[32px] shadow-2xl py-3 z-50 overflow-hidden">
+                  <div className="flex items-center justify-between px-5 py-2">
+                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">New Qualified Leads</p>
+                    <button
+                      onClick={() => { onReadNotifications(); setIsNotifOpen(false); }}
+                      disabled={unreadNotifications === 0}
+                      className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 hover:text-indigo-800 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <CheckCheck size={12} /> Mark read
+                    </button>
+                  </div>
+                  {notifications.length === 0 ? (
+                    <p className="px-5 py-8 text-center text-xs font-bold text-slate-300 italic">No qualified leads yet</p>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto custom-scrollbar">
+                      {notifications.slice(0, 20).map(n => (
+                        <button
+                          key={n.id}
+                          onClick={() => setActiveTab('conversations')}
+                          className={`w-full text-left px-5 py-3 hover:bg-slate-50 transition-colors border-t border-slate-50 ${n.readAt ? 'opacity-50' : ''}`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+                              <User size={14} />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-bold text-slate-900 truncate">{n.leadName || 'Anonymous lead'}</p>
+                              <p className="text-[10px] font-bold text-slate-400 truncate">
+                                {n.phone || n.email || 'No contact'} · Score {n.qualificationScore}
+                              </p>
+                            </div>
+                            {!n.readAt && <span className="w-2 h-2 bg-emerald-500 rounded-full shrink-0"></span>}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
             <div className="relative">
               <button onClick={() => { setIsCurrencyMenuOpen(!isCurrencyMenuOpen); setIsLangMenuOpen(false); }}
                 className="flex items-center gap-2 px-3 py-2 bg-slate-50 border border-slate-200 rounded-2xl">
@@ -125,6 +192,13 @@ const Layout: React.FC<LayoutProps> = ({
             <div className="w-10 h-10 bg-indigo-50 rounded-2xl overflow-hidden shadow-sm border-2 border-white">
               <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=Oracle`} alt="Avatar" />
             </div>
+            <button
+              onClick={onLogout}
+              title="Sign out"
+              className="w-10 h-10 rounded-2xl border border-slate-200 bg-slate-50 text-slate-400 hover:text-rose-600 hover:border-rose-200 transition-all flex items-center justify-center"
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </header>
         <div className="p-6 lg:p-12 max-w-[1600px] mx-auto w-full">{children}</div>

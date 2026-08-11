@@ -3,31 +3,47 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:prod": "tsc && vite build && node scripts/verify-dist.js",
     "preview": "vite preview",
     "server": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "start:prod": "NODE_ENV=production node server.js",
+    "check:env": "node scripts/check-env.js",
+    "verify:secrets": "node scripts/verify-dist.js",
+    "backup": "node scripts/backup.js",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",
     "axios": "^1.17.0",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^13.0.3",
     "body-parser": "^1.20.2",
     "clsx": "^2.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
+    "express-rate-limit": "^8.6.2",
     "framer-motion": "^11.0.8",
     "groq-sdk": "^0.3.3",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.2",
     "lucide-react": "^0.344.0",
     "qrcode": "^1.5.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-is": "^18.2.0",
     "recharts": "^3.8.1",
     "tailwind-merge": "^2.2.1"
   },
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^20.11.24",
     "@types/react": "^18.2.66",
     "@types/react-dom": "^18.2.22",

@@ -1,17 +1,24 @@
 
 import React, { useState } from 'react';
-import { MessageSquare, ShieldCheck, FileText, Bot, Loader2, Globe } from 'lucide-react';
-import { Conversation, Agent, SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES } from '../types';
+import { MessageSquare, ShieldCheck, FileText, Bot, Loader2, Globe, Phone, Mail, Target, TrendingUp } from 'lucide-react';
+import { Conversation, Agent, Lead, LeadQualificationStatus, SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES } from '../types';
 import { simulateAgentConversation } from '../services/ai';
 
 interface Props {
   conversations: Conversation[];
+  leads: Lead[];
   agents: Agent[];
   currentLanguage: string;
   currentCurrency: string;
 }
 
-const ConversationHub: React.FC<Props> = ({ conversations, agents, currentLanguage, currentCurrency }) => {
+const statusStyles: Record<LeadQualificationStatus, { badge: string; dot: string; label: string }> = {
+  qualified: { badge: 'bg-emerald-50 text-emerald-600 border-emerald-100', dot: 'bg-emerald-500', label: 'Qualified' },
+  pending: { badge: 'bg-amber-50 text-amber-600 border-amber-100', dot: 'bg-amber-400', label: 'Pending' },
+  unqualified: { badge: 'bg-slate-50 text-slate-400 border-slate-100', dot: 'bg-slate-300', label: 'Unqualified' },
+};
+
+const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, currentLanguage, currentCurrency }) => {
   const [selectedConvo, setSelectedConvo] = useState<string | null>(null);
   const [testAgentId, setTestAgentId] = useState(agents[0]?.id || '');
   const [chatLog, setChatLog] = useState<{role: 'user' | 'model', text: string}[]>([]);
@@ -146,28 +153,71 @@ const ConversationHub: React.FC<Props> = ({ conversations, agents, currentLangua
       {/* Leads & Stats */}
       <div className="space-y-6">
         <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-sm animate-in fade-in slide-in-from-right-4 duration-500">
-          <h4 className="font-bold text-lg text-slate-900 mb-6 flex items-center gap-2">
+          <h4 className="font-bold text-lg text-slate-900 mb-1 flex items-center gap-2">
             <ShieldCheck className="text-emerald-500" size={24} />
             Qualified Leads
           </h4>
-          <div className="space-y-4">
-             {conversations.length === 0 ? (
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-6">
+            {leads.filter(l => l.qualificationStatus === 'qualified').length} qualified · {leads.length} total captured
+          </p>
+          <div className="space-y-4 max-h-[560px] overflow-y-auto custom-scrollbar pr-1">
+             {leads.length === 0 ? (
                <div className="py-12 text-center text-slate-300">
-                 <p className="text-xs font-bold uppercase tracking-widest italic">No physical reach detected</p>
+                 <p className="text-xs font-bold uppercase tracking-widest italic">No leads captured yet</p>
+                 <p className="text-[10px] font-bold text-slate-200 mt-2">Leads are extracted automatically from customer conversations.</p>
                </div>
              ) : (
-               conversations.map(c => (
-                 <div key={c.id} className="p-4 border border-slate-50 bg-slate-50/50 rounded-2xl hover:bg-white hover:border-indigo-100 hover:shadow-lg transition-all cursor-pointer group">
-                    <div className="flex justify-between items-start mb-2">
-                      <p className="text-sm font-bold text-slate-900">{c.customerName}</p>
-                      <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100 uppercase tracking-tighter">Verified</span>
-                    </div>
-                    <p className="text-xs text-slate-500 truncate mb-3 leading-relaxed">{c.lastMessage}</p>
-                    <button className="text-[10px] font-bold text-indigo-600 flex items-center gap-1 group-hover:translate-x-1 transition-transform">
-                      <FileText size={12}/> Generate Smart Proposal
-                    </button>
-                 </div>
-               ))
+               leads.map(l => {
+                 const s = statusStyles[l.qualificationStatus] || statusStyles.pending;
+                 return (
+                   <div key={l.id} className="p-4 border border-slate-50 bg-slate-50/50 rounded-2xl hover:bg-white hover:border-indigo-100 hover:shadow-lg transition-all cursor-pointer group">
+                      <div className="flex justify-between items-start mb-2 gap-2">
+                        <p className="text-sm font-bold text-slate-900 truncate">{l.name || 'Anonymous lead'}</p>
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-tighter flex items-center gap-1 shrink-0 ${s.badge}`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`}></span>
+                          {s.label}
+                        </span>
+                      </div>
+                      {(l.phone || l.email) && (
+                        <div className="flex flex-wrap gap-2 mb-2">
+                          {l.phone && (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-slate-500 bg-white border border-slate-100 rounded-full px-2 py-0.5">
+                              <Phone size={10} className="text-indigo-400" /> {l.phone}
+                            </span>
+                          )}
+                          {l.email && (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-slate-500 bg-white border border-slate-100 rounded-full px-2 py-0.5">
+                              <Mail size={10} className="text-indigo-400" /> {l.email}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full ${l.qualificationStatus === 'qualified' ? 'bg-emerald-500' : l.qualificationStatus === 'pending' ? 'bg-amber-400' : 'bg-slate-300'}`}
+                            style={{ width: `${Math.max(2, Math.min(100, l.qualificationScore))}%` }}
+                          ></div>
+                        </div>
+                        <span className="text-[10px] font-black text-slate-500">{l.qualificationScore}</span>
+                      </div>
+                      {l.intent && (
+                        <p className="text-xs text-slate-500 leading-relaxed mb-2 line-clamp-2">{l.intent}</p>
+                      )}
+                      <div className="flex items-center justify-between mt-1">
+                        {l.touchpointName || l.agentName ? (
+                          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter flex items-center gap-1">
+                            <Target size={10} className="text-indigo-300" />
+                            {l.touchpointName || '—'} {l.agentName ? `· ${l.agentName}` : ''}
+                          </span>
+                        ) : <span />}
+                        <button className="text-[10px] font-bold text-indigo-600 flex items-center gap-1 group-hover:translate-x-1 transition-transform">
+                          <FileText size={12}/> Generate Smart Proposal
+                        </button>
+                      </div>
+                   </div>
+                 );
+               })
              )}
           </div>
         </div>

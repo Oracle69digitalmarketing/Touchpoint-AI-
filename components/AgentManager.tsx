@@ -1,15 +1,18 @@
 
 import React, { useState } from 'react';
 import { Agent, AgentStatus } from '../types';
-import { Bot, Plus, Zap, Target, BarChart3, ChevronRight, X } from 'lucide-react';
+import { Bot, Plus, Zap, Target, BarChart3, ChevronRight, X, Pencil, Trash2, Power } from 'lucide-react';
 
 interface Props {
   agents: Agent[];
   onOpenWizard: () => void;
+  onEditAgent: (agent: Agent) => void;
+  onDeleteAgent: (agent: Agent) => void;
+  onToggleStatus: (agent: Agent) => void;
   onNavigate: (tab: string) => void;
 }
 
-const AgentManager: React.FC<Props> = ({ agents, onOpenWizard, onNavigate }) => {
+const AgentManager: React.FC<Props> = ({ agents, onOpenWizard, onEditAgent, onDeleteAgent, onToggleStatus, onNavigate }) => {
   const [selectedAgentStats, setSelectedAgentStats] = useState<Agent | null>(null);
 
   return (
@@ -94,6 +97,34 @@ const AgentManager: React.FC<Props> = ({ agents, onOpenWizard, onNavigate }) => 
                   className="px-4 py-3 bg-slate-100 text-slate-600 rounded-xl hover:bg-slate-200 transition-colors"
                 >
                   <BarChart3 size={18} />
+                </button>
+              </div>
+
+              <div className="flex gap-2 pt-3">
+                <button
+                  onClick={() => onToggleStatus(agent)}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-[11px] font-bold border transition-all ${
+                    agent.status === AgentStatus.ACTIVE
+                      ? 'text-amber-600 bg-amber-50 border-amber-100 hover:bg-amber-100'
+                      : 'text-emerald-600 bg-emerald-50 border-emerald-100 hover:bg-emerald-100'
+                  }`}
+                  title={agent.status === AgentStatus.ACTIVE ? 'Deactivate agent' : 'Activate agent'}
+                >
+                  <Power size={13} /> {agent.status === AgentStatus.ACTIVE ? 'Deactivate' : 'Activate'}
+                </button>
+                <button
+                  onClick={() => onEditAgent(agent)}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-[11px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 transition-all"
+                  title="Edit agent"
+                >
+                  <Pencil size={13} /> Edit
+                </button>
+                <button
+                  onClick={() => onDeleteAgent(agent)}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-[11px] font-bold text-rose-600 bg-rose-50 border border-rose-100 hover:bg-rose-100 transition-all"
+                  title="Delete agent"
+                >
+                  <Trash2 size={13} /> Delete
                 </button>
               </div>
             </div>

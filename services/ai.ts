@@ -2,10 +2,11 @@
 /**
  * BACKEND PROXY FOR AI SERVICES
  * Keeps API keys hidden on the server.
+ * Relative URL works in production (same origin) and in development
+ * (Vite proxies /v1 to the Express API server).
  */
-const API_BASE = window.location.origin.includes('localhost:3000') 
-? 'http://localhost:3001/v1' 
-: '/v1';
+const API_BASE = '/v1';
+import { getAuthHeaders } from './auth';
 
 export const simulateAgentConversation = async (
   agent: { name: string; industry: string; voice: string; catalog?: string; documents?: string[] },
@@ -16,7 +17,7 @@ export const simulateAgentConversation = async (
   try {
     const response = await fetch(`${API_BASE}/ai/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(true),
       body: JSON.stringify({ agent, history, userInput, targetLanguage })
     });
 
@@ -43,7 +44,7 @@ export const generateAgentProposal = async (agentName: string, context: string, 
   try {
     const response = await fetch(`${API_BASE}/ai/proposal`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(true),
       body: JSON.stringify({ agentName, context, targetLanguage })
     });
 
