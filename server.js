@@ -1215,7 +1215,19 @@ const validateAgentPayload = (body, { partial = false } = {}) => {
     errors.voice = `voice must be one of: ${AGENT_VOICES.join(', ')}`;
   }
 
-  for (const field of ['industry', 'description', 'serviceCatalog', 'clientProfiles', 'caseLibrary', 'guidelines']) {
+  const MAX_KNOWLEDGE_BASE_CHARS = 20000;
+  const KNOWLEDGE_BASE_FIELDS = ['description', 'serviceCatalog', 'clientProfiles', 'caseLibrary', 'guidelines'];
+
+  for (const field of KNOWLEDGE_BASE_FIELDS) {
+    if (body[field] === undefined || body[field] === null) continue;
+    if (typeof body[field] !== 'string') {
+      errors[field] = `${field} must be a string`;
+    } else if (body[field].length > MAX_KNOWLEDGE_BASE_CHARS) {
+      errors[field] = `${field} must be ${MAX_KNOWLEDGE_BASE_CHARS} characters or fewer`;
+    }
+  }
+
+  for (const field of ['industry']) {
     if (body[field] === undefined || body[field] === null) continue;
     if (typeof body[field] !== 'string') {
       errors[field] = `${field} must be a string`;

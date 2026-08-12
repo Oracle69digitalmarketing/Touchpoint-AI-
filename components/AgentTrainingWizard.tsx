@@ -19,6 +19,16 @@ const STEPS = [
   { id: 'review', title: 'Review', icon: CheckCircle },
 ];
 
+const KNOWLEDGE_BASE_LIMIT = 20000;
+
+const formatCount = (n: number) => n.toLocaleString('en-US');
+
+const CharacterCounter: React.FC<{ value: string; max: number }> = ({ value, max }) => (
+  <div className={`text-right text-xs font-medium mt-1 ${value.length >= max ? 'text-red-500' : 'text-slate-400'}`}>
+    {formatCount(value.length)} / {formatCount(max)}
+  </div>
+);
+
 const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agent }) => {
   const [currentStep, setCurrentStep] = useState(0);
   const [isTraining, setIsTraining] = useState(false);
@@ -132,8 +142,10 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none h-32 font-mono text-sm"
                  placeholder="List your products, prices, and value propositions..."
                  value={formData.serviceCatalog}
+                 maxLength={KNOWLEDGE_BASE_LIMIT}
                  onChange={e => setFormData({...formData, serviceCatalog: e.target.value})}
                />
+               <CharacterCounter value={formData.serviceCatalog} max={KNOWLEDGE_BASE_LIMIT} />
              </div>
 
              {/* Document Uploads Section */}
@@ -179,8 +191,10 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none h-40"
                placeholder="Who are your ideal customers? What are their pain points?"
                value={formData.clientProfiles}
+               maxLength={KNOWLEDGE_BASE_LIMIT}
                onChange={e => setFormData({...formData, clientProfiles: e.target.value})}
              />
+             <CharacterCounter value={formData.clientProfiles} max={KNOWLEDGE_BASE_LIMIT} />
           </div>
         );
       case 3:
@@ -191,8 +205,10 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none h-40"
                placeholder="Share specific outcomes you've achieved for clients..."
                value={formData.caseLibrary}
+               maxLength={KNOWLEDGE_BASE_LIMIT}
                onChange={e => setFormData({...formData, caseLibrary: e.target.value})}
              />
+             <CharacterCounter value={formData.caseLibrary} max={KNOWLEDGE_BASE_LIMIT} />
           </div>
         );
       case 4:
