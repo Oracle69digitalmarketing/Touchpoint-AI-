@@ -13,7 +13,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import Groq from 'groq-sdk';
 import axios from 'axios';
-import { config, assertValidEnvironment } from './config/env.js';
+import { config, assertValidEnvironment, resolveTrustProxy } from './config/env.js';
 import {
   initDatabase,
   pingDatabase,
@@ -203,14 +203,17 @@ app.use((req, res, next) => {
 });
 
 // Behind a reverse proxy (nginx, Caddy, a PAAS load balancer) the real client
-// IP arrives via X-Forwarded-For. Enable TRUST_PROXY only when the app is
-// actually served behind one — otherwise an attacker can forge the header and
-// defeat the per-IP rate limiters. The value is a hop count ("1" for a single
-// trusted proxy).
-const trustProxy = config.trustProxy;
-if (trustProxy !== undefined && trustProxy !== '') {
-  const hops = Number(trustProxy);
-  app.set('trust proxy', Number.isInteger(hops) && hops > 0 ? hops : trustProxy);
+// IP arrives via X-Forwarded-For, and express-rate-limit refuses to run when
+// that header is present while `trust proxy` is disabled
+// (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR). `resolveTrustProxy` produces a hop
+// count (never the permissive `true`), defaulting to one trusted hop in
+// production — Render's documented layout — while an explicit TRUST_PROXY
+// (including TRUST_PROXY=0 to opt out) always wins. In non-production modes
+// nothing is trusted unless TRUST_PROXY is set, so a client cannot forge the
+// header to defeat the per-IP rate limiters.
+const trustProxy = resolveTrustProxy(process.env);
+if (trustProxy !== false) {
+  app.set('trust proxy', trustProxy);
 }
 
 const CORS_ORIGINS = config.corsOrigins;
@@ -793,13 +796,19 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
 
   const completion = await groqClient.chat.completions.create({
     messages,
-    model: 'llama3-70b-8192',
+    model: 'llama-3.3-70b-versatile',
     temperature: 0.7,
     max_tokens: 150,
   });
 
   return completion.choices[0]?.message?.content;
 }
+
+// Customer-facing fallback when the AI provider is unreachable or returns an
+// empty reply. Deliberately generic and safe: it never exposes provider
+// errors, stack traces, secrets, or internal implementation details. Full
+// error detail is always logged server-side instead.
+const AI_FALLBACK_REPLY = "Thanks for reaching out! I'm having a quick connectivity issue — I'll be right with you.";
 
 /**
  * AI ENDPOINTS
@@ -818,8 +827,10 @@ app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
 
     res.json({ text });
   } catch (error) {
+    // Log the full detail server-side; the client only ever sees the safe,
+    // graceful fallback message.
     console.error("Groq Error:", error);
-    res.status(500).json({ error: "AI logic error" });
+    res.status(500).json({ error: AI_FALLBACK_REPLY });
   }
 }));
 
@@ -832,7 +843,7 @@ app.post('/v1/ai/proposal', asyncHandler(async (req, res) => {
         { role: 'system', content: `You are a professional proposal generator. Output ONLY valid JSON.` },
         { role: 'user', content: `Context: ${context}. Language: ${targetLanguage}. Generate a proposal from ${agentName}.` }
       ],
-      model: 'llama3-70b-8192',
+      model: 'llama-3.3-70b-versatile',
       response_format: { type: "json_object" }
     });
     res.json(JSON.parse(completion.choices[0]?.message?.content || '{}'));
@@ -955,7 +966,7 @@ async function runLeadExtraction({ history }) {
       { role: 'system', content: LEAD_EXTRACTION_PROMPT },
       { role: 'user', content: `Conversation transcript:\n${transcript}\n\nExtract the lead as JSON.` },
     ],
-    model: 'llama3-70b-8192',
+    model: 'llama-3.3-70b-versatile',
     temperature: 0,
     response_format: { type: 'json_object' },
   });
@@ -1593,12 +1604,15 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
       targetLanguage,
     });
   } catch (error) {
+    // Never surface the provider error to a customer: log the full detail
+    // server-side and fall through to the same graceful reply used for an
+    // empty AI response, so the conversation continues and nothing internal
+    // leaks to the public endpoint.
     console.error("[Public Touchpoint] Groq Error:", error);
-    return res.status(500).json({ error: 'AI logic error' });
   }
 
   if (typeof replyText !== 'string' || !replyText.trim()) {
-    replyText = "Thanks for reaching out! I'm having a quick connectivity issue — I'll be right with you.";
+    replyText = AI_FALLBACK_REPLY;
   }
 
   addConversationMessage({ conversationId: conversation.id, role: 'user', text: message });

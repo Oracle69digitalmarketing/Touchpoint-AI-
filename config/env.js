@@ -118,6 +118,42 @@ export function assertValidEnvironment(rawEnv = process.env) {
 }
 
 /**
+ * Resolves the Express `trust proxy` setting (hop count / proxy spec).
+ *
+ * express-rate-limit refuses to process a request that carries an
+ * `X-Forwarded-For` header while `trust proxy` is still false — it throws
+ * ERR_ERL_UNEXPECTED_X_FORWARDED_FOR. Render (and similar PAAS) always route
+ * traffic through a reverse proxy that sets that header, so without a trust
+ * proxy setting every rate-limited route 500s behind Render.
+ *
+ * The value is never the permissive boolean `true` (that would let any client
+ * forge its IP and bypass the per-IP rate limiters); it is either a hop count
+ * or an explicit proxy IP / CIDR list:
+ *   - TRUST_PROXY=<n>           → hop count, e.g. "1" for Render's single hop
+ *   - TRUST_PROXY=<ip|cidr,..>  → explicit trusted proxy addresses
+ *   - TRUST_PROXY=0             → explicit opt-out (no proxy in front)
+ *   - unset in production       → default to one hop (this project's only
+ *                                 production target is Render, which sits
+ *                                 directly in front of the app)
+ *   - unset otherwise           → false (no proxy; do not trust forwarded
+ *                                 headers, so they cannot be forged)
+ */
+export function resolveTrustProxy(rawEnv = process.env) {
+  const env = normalizeEnv(rawEnv);
+  const value = env.TRUST_PROXY;
+
+  if (value === undefined || value === '') {
+    const nodeEnv = (env.NODE_ENV || 'development').toLowerCase();
+    return nodeEnv === 'production' ? 1 : false;
+  }
+
+  const hops = Number(value);
+  if (Number.isInteger(hops) && hops > 0) return hops;
+  if (hops === 0) return false;
+  return value;
+}
+
+/**
  * Normalized, typed configuration derived from the current environment.
  */
 export function loadConfig(rawEnv = process.env) {
