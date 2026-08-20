@@ -575,14 +575,25 @@ app.post('/v1/auth/forgot-password', asyncHandler(async (req, res) => {
     await createResetToken({ userId: user.id, tokenHash, expiresAt });
 
     const resetUrl = `${APP_URL}/reset-password?token=${rawToken}`;
-    await resend.emails.send({
-      from: config.emailFrom,
-      to: user.email,
-      subject: 'Reset your TouchPoint AI password',
-      html: `<p>You requested a password reset. Click the link below to set a new password:</p>
-             <p><a href="${resetUrl}">Reset Password</a></p>
-             <p>This link expires in 1 hour.</p>`,
-    });
+    // Delivery failures must never change the response: a 500 here would only
+    // happen for accounts that exist, turning the endpoint into an
+    // enumeration oracle. The outcome stays generic either way.
+    if (!resend) {
+      console.warn('[Auth] Password reset email skipped: no Resend API key');
+    } else {
+      try {
+        await resend.emails.send({
+          from: config.emailFrom,
+          to: user.email,
+          subject: 'Reset your TouchPoint AI password',
+          html: `<p>You requested a password reset. Click the link below to set a new password:</p>
+                 <p><a href="${resetUrl}">Reset Password</a></p>
+                 <p>This link expires in 1 hour.</p>`,
+        });
+      } catch (error) {
+        console.error('[Auth] Failed to send password reset email:', error.message);
+      }
+    }
   }
 
   res.status(200).json({ message: 'If an account exists, a reset email has been sent.' });
