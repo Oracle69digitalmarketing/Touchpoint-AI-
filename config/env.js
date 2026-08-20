@@ -36,8 +36,11 @@ const NORMALIZED_ENV_KEYS = [
   'PAYSTACK_PLAN_CODE_BUSINESS',
   'APP_URL',
   'CORS_ORIGIN',
+  'DATABASE_URL',
   'DATA_DIR',
   'TRUST_PROXY',
+  'RESEND_API_KEY',
+  'EMAIL_FROM',
 ];
 
 const normalizeEnv = (env = process.env) => {
@@ -91,6 +94,12 @@ export function validateEnvironment(rawEnv = process.env) {
     }
     if (!env.PAYSTACK_SECRET_KEY) {
       errors.push('PAYSTACK_SECRET_KEY is required in production (billing, webhooks and identity resolution all depend on it)');
+    }
+    if (!env.RESEND_API_KEY) {
+      errors.push('RESEND_API_KEY is required in production (for email verification)');
+    }
+    if (!env.EMAIL_FROM) {
+      errors.push('EMAIL_FROM is required in production (the sender address for verification emails)');
     }
     if (!env.APP_URL) {
       errors.push('APP_URL is required in production (used to build touchpoint links and the Paystack callback URL)');
@@ -171,11 +180,14 @@ export function loadConfig(rawEnv = process.env) {
     sessionTtlDays: Number(env.SESSION_TTL_DAYS || 7),
     groqApiKey: env.GROQ_API_KEY,
     paystackSecretKey: env.PAYSTACK_SECRET_KEY,
+    resendApiKey: env.RESEND_API_KEY,
+    emailFrom: env.EMAIL_FROM,
     appUrl,
     corsOrigins: (env.CORS_ORIGIN || 'http://localhost:3000')
       .split(',')
       .map((origin) => origin.trim())
       .filter(Boolean),
+    databaseUrl: env.DATABASE_URL,
     trustProxy: env.TRUST_PROXY,
   };
 }

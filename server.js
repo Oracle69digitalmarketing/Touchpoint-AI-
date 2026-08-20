@@ -12,10 +12,22 @@ import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import Groq from 'groq-sdk';
-import axios from 'axios';
+import { Resend } from 'resend';
+const resend = new Resend(config.resendApiKey);
+
+async function sendVerificationEmail(email, token) {
+  const url = `${config.appUrl}/v1/auth/verify-email/${token}`;
+  await resend.emails.send({
+    from: config.emailFrom,
+    to: email,
+    subject: 'Verify your TouchPoint AI account',
+    html: `<p>Please verify your email address by clicking the link below:</p>
+           <p><a href="${url}">Verify Email</a></p>
+           <p>This link expires in 24 hours.</p>`,
+  });
+}
 import { config, assertValidEnvironment, resolveTrustProxy } from './config/env.js';
 import {
-  initDatabase,
   pingDatabase,
   closeDatabase,
   createBusiness,
@@ -63,7 +75,7 @@ import {
   countAnalyticsRows,
   analyticsBucketCounts,
   analyticsGroupedCounts,
-  toSqliteDateTime,
+  toSqlDateTime,
   getSubscription,
   resolveSubscription,
   upsertSubscription,
@@ -74,7 +86,7 @@ import {
   setPaystackTransactionFinalStatus,
   hasWebhookEvent,
   recordWebhookEvent,
-} from './db.js';
+} from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -84,8 +96,6 @@ const __dirname = path.dirname(__filename);
 // deployment that is missing a required secret or misconfigured (see
 // config/env.js). In development/test only JWT_SECRET is mandatory.
 assertValidEnvironment(process.env);
-
-initDatabase();
 
 const app = express();
 const PORT = config.port;
@@ -343,12 +353,12 @@ const publicBusiness = (business) => ({
   } : undefined,
 });
 
-function signToken(user) {
+async function signToken(user) {
   const sessionId = crypto.randomUUID();
-  createSession({
+  await createSession({
     id: sessionId,
     userId: user.id,
-    businessId: user.business_id,
+    business_id: user.business_id,
     ttlSeconds: SESSION_TTL_SECONDS,
   });
   const token = jwt.sign(
@@ -364,7 +374,7 @@ function signToken(user) {
  * loads the user + their business, and attaches them to the request.
  * Rejects unauthenticated callers with 401 before any handler runs.
  */
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
 
@@ -379,12 +389,12 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  const session = findSession(payload.sid);
+  const session = await findSession(payload.sid);
   if (!session) {
     return res.status(401).json({ error: 'Session no longer active, please sign in again' });
   }
 
-  const user = findUserById(payload.sub);
+  const user = await findUserById(payload.sub);
   if (!user) {
     return res.status(401).json({ error: 'User not found' });
   }
@@ -422,7 +432,7 @@ app.post('/v1/auth/register', asyncHandler(async (req, res) => {
 
   const normalizedEmail = email.trim().toLowerCase();
 
-  if (findUserByEmail(normalizedEmail)) {
+  if (await findUserByEmail(normalizedEmail)) {
     return res.status(409).json({ error: 'An account with this email already exists' });
   }
 
@@ -430,30 +440,43 @@ app.post('/v1/auth/register', asyncHandler(async (req, res) => {
   const baseSlug = businessName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'business';
   let slug = baseSlug;
   let suffix = 2;
-  while (businessSlugExists(slug)) {
+  while (await businessSlugExists(slug)) {
     slug = `${baseSlug}-${suffix++}`;
   }
 
   const passwordHash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
-  const business = createBusiness(businessName.trim(), slug);
+  const business = await createBusiness(businessName.trim(), slug);
   const userId = crypto.randomUUID();
-  createUser({
+  const verificationToken = crypto.randomBytes(32).toString('hex');
+  const verificationExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  await createUser({
     id: userId,
     businessId: business.id,
     email: normalizedEmail,
     passwordHash,
     name: name.trim(),
     role: 'owner',
+    emailVerified: false,
+    verificationToken,
+    verificationExpiresAt,
   });
 
-  const user = findUserById(userId);
-  const token = signToken(user);
+  await sendVerificationEmail(normalizedEmail, verificationToken);
 
-  return res.status(201).json({
-    token,
-    user: publicUser(user),
-    business: publicBusiness(business),
-  });
+  return res.status(201).json({ message: 'User registered, check email to verify' });
+}));
+
+app.get('/v1/auth/verify-email/:token', asyncHandler(async (req, res) => {
+  const { token } = req.params;
+  const user = await pool.query('SELECT id FROM users WHERE verification_token = $1 AND verification_expires_at > CURRENT_TIMESTAMP', [token]);
+  
+  if (user.rowCount === 0) {
+    return res.status(400).json({ error: 'Invalid or expired verification token' });
+  }
+
+  await pool.query('UPDATE users SET email_verified = TRUE, verification_token = NULL, verification_expires_at = NULL WHERE id = $1', [user.rows[0].id]);
+  return res.json({ message: 'Email verified successfully' });
 }));
 
 app.post('/v1/auth/login', asyncHandler(async (req, res) => {
@@ -464,7 +487,7 @@ app.post('/v1/auth/login', asyncHandler(async (req, res) => {
   }
 
   const normalizedEmail = email.trim().toLowerCase();
-  const user = findUserByEmail(normalizedEmail);
+  const user = await findUserByEmail(normalizedEmail);
 
   // Compare against a dummy hash when the user is unknown so the response
   // timing stays consistent and does not reveal whether the email exists.
@@ -474,7 +497,11 @@ app.post('/v1/auth/login', asyncHandler(async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
-  const token = signToken(user);
+  if (!user.email_verified) {
+    return res.status(403).json({ error: 'Please verify your email address before logging in' });
+  }
+
+  const token = await signToken(user);
 
   return res.json({
     token,
@@ -483,17 +510,17 @@ app.post('/v1/auth/login', asyncHandler(async (req, res) => {
   });
 }));
 
-app.get('/v1/auth/me', requireAuth, (req, res) => {
+app.get('/v1/auth/me', requireAuth, asyncHandler(async (req, res) => {
   res.json({
     user: publicUser(req.user),
     business: publicBusiness(req.business),
   });
-});
+}));
 
-app.post('/v1/auth/logout', requireAuth, (req, res) => {
-  revokeSession(req.sessionId);
+app.post('/v1/auth/logout', requireAuth, asyncHandler(async (req, res) => {
+  await revokeSession(req.sessionId);
   res.json({ success: true });
-});
+}));
 
 /**
  * BILLING (Phase 7) — server-authoritative Paystack subscriptions
@@ -520,7 +547,7 @@ const SUBSCRIPTION_LIFECYCLE_EVENTS = ['subscription.create', 'subscription.disa
 // some environments surface failed/abandoned charges explicitly.
 const CHARGE_FAILED_EVENTS = ['charge.failed', 'charge.abandoned'];
 
-const nowSqlite = () => toSqliteDateTime(new Date());
+const nowSqlite = () => toSqlDateTime(new Date());
 
 /**
  * Verifies a Paystack webhook signature: HMAC-SHA512 of the raw request body
@@ -541,8 +568,8 @@ function verifyPaystackSignature(rawBody, signature) {
  * come from resolveSubscription (a cancelled subscription keeps its tier until
  * its period ends, an expired one is Free).
  */
-function getPublicSubscription(businessId) {
-  const resolved = resolveSubscription(getSubscription(businessId));
+async function getPublicSubscription(businessId) {
+  const resolved = await resolveSubscription(await getSubscription(businessId));
   return {
     plan: resolved.plan,
     status: resolved.status,
@@ -558,7 +585,7 @@ function getPublicSubscription(businessId) {
 }
 
 async function ensurePaystackCustomer({ user, business }) {
-  const current = getSubscription(business.id);
+  const current = await getSubscription(business.id);
   if (current.paystack_customer_code) return current.paystack_customer_code;
 
   const result = await paystackClient.createCustomer({
@@ -569,12 +596,12 @@ async function ensurePaystackCustomer({ user, business }) {
   if (!customerCode) {
     throw Object.assign(new Error('Could not create Paystack customer'), { status: 502 });
   }
-  upsertSubscription(business.id, { paystackCustomerCode: customerCode });
+  await upsertSubscription(business.id, { paystackCustomerCode: customerCode });
   return customerCode;
 }
 
 async function cancelPaystackSubscription(businessId) {
-  const current = getSubscription(businessId);
+  const current = await getSubscription(businessId);
   if (!current.paystack_subscription_code) return;
   try {
     await paystackClient.disableSubscription({
@@ -594,28 +621,28 @@ async function cancelPaystackSubscription(businessId) {
  * against server-recorded values, so a spoofed or mistyped event cannot grant
  * an entitlement the server did not intend.
  */
-function applySuccessfulCharge({ transaction, payload }) {
-  const current = getPaystackTransaction(transaction.reference);
+async function applySuccessfulCharge({ transaction, payload }) {
+  const current = await getPaystackTransaction(transaction.reference);
   if (!current || current.status !== 'pending') return current;
 
   if (!current.plan_code) {
     // One-time charge: the charged amount must match what the server recorded.
     if (typeof payload.amount === 'number' && payload.amount !== current.amount) {
       console.warn(`[Billing] Amount mismatch for ${current.reference}: got ${payload.amount}, expected ${current.amount}`);
-      setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'amount_mismatch' });
+      await setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'amount_mismatch' });
       return null;
     }
   }
   if (typeof payload.currency === 'string' && payload.currency !== current.currency) {
     console.warn(`[Billing] Currency mismatch for ${current.reference}: got ${payload.currency}, expected ${current.currency}`);
-    setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'currency_mismatch' });
+    await setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'currency_mismatch' });
     return null;
   }
 
   const eventPlanCode = payload.plan && payload.plan.plan_code;
   if (current.plan_code && eventPlanCode && eventPlanCode !== current.plan_code) {
     console.warn(`[Billing] Plan code mismatch for ${current.reference}`);
-    setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'plan_code_mismatch' });
+    await setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'plan_code_mismatch' });
     return null;
   }
 
@@ -627,7 +654,7 @@ function applySuccessfulCharge({ transaction, payload }) {
   const customerCode = payload.customer && payload.customer.customer_code;
   const subscriptionCode = payload.subscription && payload.subscription.subscription_code;
 
-  upsertSubscription(current.business_id, {
+  await upsertSubscription(current.business_id, {
     plan: current.plan,
     status: 'active',
     paystackPlanCode: eventPlanCode || current.plan_code || undefined,
@@ -640,13 +667,13 @@ function applySuccessfulCharge({ transaction, payload }) {
     lastReference: current.reference,
   });
 
-  return setPaystackTransactionFinalStatus(current.reference, 'success', { event: 'charge.success' });
+  return await setPaystackTransactionFinalStatus(current.reference, 'success', { event: 'charge.success' });
 }
 
-function markChargeFailed(reference, status, event, error) {
-  const transaction = getPaystackTransaction(reference);
+async function markChargeFailed(reference, status, event, error) {
+  const transaction = await getPaystackTransaction(reference);
   if (!transaction || transaction.status !== 'pending') return transaction;
-  return setPaystackTransactionFinalStatus(reference, status, { event, error });
+  return await setPaystackTransactionFinalStatus(reference, status, { event, error });
 }
 
 /**
@@ -662,7 +689,7 @@ function markChargeFailed(reference, status, event, error) {
  *   - charge.success            -> entitlement granted (after cross-checks);
  *   - subscription lifecycle    -> cancellation / expiry persisted.
  */
-app.post('/v1/billing/webhook', (req, res) => {
+app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
   if (!verifyPaystackSignature(req.rawBody, signature)) {
     return res.status(401).json({ error: 'Invalid webhook signature' });
@@ -673,74 +700,74 @@ app.post('/v1/billing/webhook', (req, res) => {
   const eventId = typeof event.id === 'string' ? event.id : null;
   const data = event.data || {};
 
-  if (eventId && hasWebhookEvent(eventId)) {
+  if (eventId && await hasWebhookEvent(eventId)) {
     return res.json({ received: true, duplicate: true });
   }
 
   if (eventType === 'charge.success') {
     const reference = typeof data.reference === 'string' ? data.reference : '';
-    const transaction = reference ? getPaystackTransaction(reference) : null;
+    const transaction = reference ? await getPaystackTransaction(reference) : null;
     if (!transaction) {
-      recordWebhookEvent({ eventId, eventType });
+      await recordWebhookEvent({ eventId, eventType });
       return res.json({ received: true, ignored: 'unknown_reference' });
     }
     const metadataBusinessId = data.metadata && data.metadata.business_id;
     if (metadataBusinessId && metadataBusinessId !== transaction.business_id) {
-      recordWebhookEvent({ eventId, eventType });
+      await recordWebhookEvent({ eventId, eventType });
       return res.json({ received: true, ignored: 'metadata_mismatch' });
     }
-    applySuccessfulCharge({ transaction, payload: data });
-    recordWebhookEvent({ eventId, eventType, businessId: transaction.business_id });
-    return res.json({ received: true, subscription: getPublicSubscription(transaction.business_id) });
+    await applySuccessfulCharge({ transaction, payload: data });
+    await recordWebhookEvent({ eventId, eventType, businessId: transaction.business_id });
+    return res.json({ received: true, subscription: await getPublicSubscription(transaction.business_id) });
   }
 
   if (CHARGE_FAILED_EVENTS.includes(eventType)) {
     const reference = typeof data.reference === 'string' ? data.reference : '';
-    const transaction = reference ? getPaystackTransaction(reference) : null;
+    const transaction = reference ? await getPaystackTransaction(reference) : null;
     if (transaction) {
-      markChargeFailed(reference, eventType === 'charge.abandoned' ? 'abandoned' : 'failed', eventType);
+      await markChargeFailed(reference, eventType === 'charge.abandoned' ? 'abandoned' : 'failed', eventType);
     }
-    recordWebhookEvent({ eventId, eventType, businessId: transaction ? transaction.business_id : null });
+    await recordWebhookEvent({ eventId, eventType, businessId: transaction ? transaction.business_id : null });
     return res.json({ received: true });
   }
 
   if (SUBSCRIPTION_LIFECYCLE_EVENTS.includes(eventType)) {
     const subscriptionCode = data.subscription_code || (data.subscription && data.subscription.subscription_code) || null;
-    const subscription = subscriptionCode ? findSubscriptionBySubscriptionCode(subscriptionCode) : null;
+    const subscription = subscriptionCode ? await findSubscriptionBySubscriptionCode(subscriptionCode) : null;
 
     if (eventType === 'subscription.create') {
       const customerCode = data.customer && data.customer.customer_code;
       const planCode = data.plan && data.plan.plan_code;
       const emailToken = data.email_token || null;
-      const byCustomer = customerCode ? findSubscriptionByCustomerCode(customerCode) : null;
+      const byCustomer = customerCode ? await findSubscriptionByCustomerCode(customerCode) : null;
       if (byCustomer) {
-        upsertSubscription(byCustomer.business_id, {
+        await upsertSubscription(byCustomer.business_id, {
           paystackSubscriptionCode: subscriptionCode || undefined,
           paystackPlanCode: planCode || undefined,
           paystackEmailToken: emailToken || undefined,
         });
-        recordWebhookEvent({ eventId, eventType, businessId: byCustomer.business_id });
+        await recordWebhookEvent({ eventId, eventType, businessId: byCustomer.business_id });
         return res.json({ received: true });
       }
     } else if (subscription) {
       if (eventType === 'subscription.disable') {
-        upsertSubscription(subscription.business_id, { status: 'cancelled', cancelledAt: nowSqlite() });
+        await upsertSubscription(subscription.business_id, { status: 'cancelled', cancelledAt: nowSqlite() });
       } else if (eventType === 'subscription.expired') {
-        upsertSubscription(subscription.business_id, { status: 'expired', expiresAt: nowSqlite() });
+        await upsertSubscription(subscription.business_id, { status: 'expired', expiresAt: nowSqlite() });
       } else if (eventType === 'subscription.not_renew') {
-        upsertSubscription(subscription.business_id, { status: 'not_renewing' });
+        await upsertSubscription(subscription.business_id, { status: 'not_renewing' });
       }
-      recordWebhookEvent({ eventId, eventType, businessId: subscription.business_id });
+      await recordWebhookEvent({ eventId, eventType, businessId: subscription.business_id });
       return res.json({ received: true });
     }
 
-    recordWebhookEvent({ eventId, eventType, businessId: subscription ? subscription.business_id : null });
+    await recordWebhookEvent({ eventId, eventType, businessId: subscription ? subscription.business_id : null });
     return res.json({ received: true });
   }
 
-  recordWebhookEvent({ eventId, eventType });
+  await recordWebhookEvent({ eventId, eventType });
   res.json({ received: true });
-});
+}));
 
 /**
  * WORKSPACE AUTH GATE
@@ -983,29 +1010,29 @@ async function runLeadExtraction({ history }) {
  * dropped (never the customer conversation), and the exhaustion is logged.
  */
 async function captureLeadFromConversation({ conversation, touchpoint, agent }) {
-  const history = listConversationMessages(conversation.id);
+  const history = await listConversationMessages(conversation.id);
   if (history.length === 0) return null;
 
   const content = await runLeadExtraction({ history });
   const extracted = parseExtractedLead(content);
   if (!extracted) return null;
 
-  const business = getBusinessById(touchpoint.business_id);
+  const business = await getBusinessById(touchpoint.business_id);
   const plan = (business && business.plan) || 'Free';
   const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.Free;
 
-  const existing = findLeadByConversation(touchpoint.business_id, conversation.id);
+  const existing = await findLeadByConversation(touchpoint.business_id, conversation.id);
   let lead;
   if (existing) {
-    lead = updateLead(touchpoint.business_id, existing.id, extracted);
+    lead = await updateLead(touchpoint.business_id, existing.id, extracted);
   } else {
-    if (countLeads(touchpoint.business_id) >= limits.leads) {
+    if ((await countLeads(touchpoint.business_id)) >= limits.leads) {
       console.warn(
         `[Lead Capture] ${plan} plan lead limit (${limits.leads}) reached for business ${touchpoint.business_id}; skipping persistence`
       );
       return null;
     }
-    lead = createLead({
+    lead = await createLead({
       businessId: touchpoint.business_id,
       touchpointId: touchpoint.id,
       conversationId: conversation.id,
@@ -1016,7 +1043,7 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent }) 
   }
 
   if (lead && lead.qualification_status === 'qualified' && !lead.notified) {
-    createLeadNotification({ businessId: touchpoint.business_id, leadId: lead.id });
+    await createLeadNotification({ businessId: touchpoint.business_id, leadId: lead.id });
   }
   return lead;
 }
@@ -1070,10 +1097,11 @@ app.get('/v1/identity/banks', asyncHandler(async (req, res) => {
 
 // Health Check. Includes a live SQLite round-trip so load balancers and
 // deployment health checks can tell "process is up" from "app is usable".
-app.get('/v1/health', (req, res) => {
+app.get('/v1/health', asyncHandler(async (req, res) => {
   let database = 'ok';
   try {
-    pingDatabase();
+    const ok = await pingDatabase();
+    if (!ok) database = 'error';
   } catch (err) {
     database = 'error';
   }
@@ -1083,15 +1111,15 @@ app.get('/v1/health', (req, res) => {
     database,
     timestamp: new Date().toISOString(),
   });
-});
+}));
 
 // List the authenticated business's CRM connections
-app.get('/v1/crm/connections', (req, res) => {
-  res.status(200).json({ success: true, connections: listCRMConnections(req.business.id) });
-});
+app.get('/v1/crm/connections', requireAuth, asyncHandler(async (req, res) => {
+  res.status(200).json({ success: true, connections: await listCRMConnections(req.business.id) });
+}));
 
 // Connect CRM
-app.post('/v1/crm/connect', asyncHandler(async (req, res) => {
+app.post('/v1/crm/connect', requireAuth, asyncHandler(async (req, res) => {
   const { providerId } = req.body;
 
   if (!providerId) {
@@ -1112,7 +1140,7 @@ app.post('/v1/crm/connect', asyncHandler(async (req, res) => {
 
     // Persist the connection in SQLite, owned by this business
     const syncTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    saveCRMConnection(req.business.id, providerId, syncTime);
+    await saveCRMConnection(req.business.id, providerId, syncTime);
 
     res.status(200).json({
       success: true,
@@ -1127,16 +1155,16 @@ app.post('/v1/crm/connect', asyncHandler(async (req, res) => {
 }));
 
 // Disconnect CRM (only the owning business can disconnect)
-app.delete('/v1/crm/disconnect/:providerId', (req, res) => {
+app.delete('/v1/crm/disconnect/:providerId', requireAuth, asyncHandler(async (req, res) => {
   const { providerId } = req.params;
 
-  if (removeCRMConnection(req.business.id, providerId)) {
+  if (await removeCRMConnection(req.business.id, providerId)) {
     console.log(`[Backend] Disconnected: ${providerId}`);
     return res.status(200).json({ success: true });
   }
 
   res.status(404).json({ success: false, message: "Provider not found" });
-});
+}));
 
 /**
  * AGENTS & TOUCHPOINTS (Phase 3)
@@ -1188,10 +1216,10 @@ const publicTouchpoint = (tp) => ({
  * is used rather than node:crypto.randomBytes). The unique DB index is the
  * final guarantee, so a rare collision is simply retried.
  */
-function generateTrackingId() {
+async function generateTrackingId() {
   for (let attempt = 0; attempt < 10; attempt++) {
     const trackingId = `TX-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
-    if (!trackingIdExists(trackingId)) return trackingId;
+    if (!await trackingIdExists(trackingId)) return trackingId;
   }
   throw new Error('Could not allocate a unique tracking id');
 }
@@ -1246,12 +1274,13 @@ const validateAgentPayload = (body, { partial = false } = {}) => {
 };
 
 // List the authenticated business's agents
-app.get('/v1/agents', (req, res) => {
-  res.status(200).json({ agents: listAgents(req.business.id).map(publicAgent) });
-});
+app.get('/v1/agents', asyncHandler(async (req, res) => {
+  const agents = await listAgents(req.business.id);
+  res.status(200).json({ agents: agents.map(publicAgent) });
+}));
 
 // Create an agent, enforcing the business plan's agent limit
-app.post('/v1/agents', (req, res) => {
+app.post('/v1/agents', asyncHandler(async (req, res) => {
   const errors = validateAgentPayload(req.body || {});
   if (Object.keys(errors).length > 0) {
     return res.status(400).json({ error: 'Validation failed', fields: errors });
@@ -1259,7 +1288,7 @@ app.post('/v1/agents', (req, res) => {
 
   const plan = req.business.plan || 'Free';
   const limit = PLAN_LIMITS[plan] ? PLAN_LIMITS[plan].agents : PLAN_LIMITS.Free.agents;
-  if (countAgents(req.business.id) >= limit) {
+  if (await countAgents(req.business.id) >= limit) {
     return res.status(403).json({
       error: `Agent limit reached: your ${plan} plan supports up to ${limit} agent(s).`,
       code: 'PLAN_LIMIT_EXCEEDED',
@@ -1267,7 +1296,7 @@ app.post('/v1/agents', (req, res) => {
   }
 
   const body = req.body;
-  const agent = createAgent(req.business.id, {
+  const agent = await createAgent(req.business.id, {
     name: body.name.trim(),
     status: body.status || 'Active',
     industry: body.industry || 'General',
@@ -1281,18 +1310,18 @@ app.post('/v1/agents', (req, res) => {
   });
 
   res.status(201).json({ agent: publicAgent(agent) });
-});
+}));
 
 // Get a single agent (scoped to the authenticated business)
-app.get('/v1/agents/:id', (req, res) => {
-  const agent = getAgentById(req.business.id, req.params.id);
+app.get('/v1/agents/:id', asyncHandler(async (req, res) => {
+  const agent = await getAgentById(req.business.id, req.params.id);
   if (!agent) return res.status(404).json({ error: 'Agent not found' });
   res.status(200).json({ agent: publicAgent(agent) });
-});
+}));
 
 // Update an agent (scoped to the authenticated business)
-app.put('/v1/agents/:id', (req, res) => {
-  const existing = getAgentById(req.business.id, req.params.id);
+app.put('/v1/agents/:id', asyncHandler(async (req, res) => {
+  const existing = await getAgentById(req.business.id, req.params.id);
   if (!existing) return res.status(404).json({ error: 'Agent not found' });
 
   const errors = validateAgentPayload(req.body || {}, { partial: true });
@@ -1300,26 +1329,27 @@ app.put('/v1/agents/:id', (req, res) => {
     return res.status(400).json({ error: 'Validation failed', fields: errors });
   }
 
-  const updated = updateAgent(req.business.id, req.params.id, req.body);
+  const updated = await updateAgent(req.business.id, req.params.id, req.body);
   res.status(200).json({ agent: publicAgent(updated) });
-});
+}));
 
 // Delete an agent (scoped to the authenticated business)
-app.delete('/v1/agents/:id', (req, res) => {
-  if (!deleteAgent(req.business.id, req.params.id)) {
+app.delete('/v1/agents/:id', asyncHandler(async (req, res) => {
+  if (!await deleteAgent(req.business.id, req.params.id)) {
     return res.status(404).json({ error: 'Agent not found' });
   }
   res.status(200).json({ success: true });
-});
+}));
 
 // List the authenticated business's touchpoints (with their connected agents)
-app.get('/v1/touchpoints', (req, res) => {
-  res.status(200).json({ touchpoints: listTouchpoints(req.business.id).map(publicTouchpoint) });
-});
+app.get('/v1/touchpoints', asyncHandler(async (req, res) => {
+  const touchpoints = await listTouchpoints(req.business.id);
+  res.status(200).json({ touchpoints: touchpoints.map(publicTouchpoint) });
+}));
 
 // Create a touchpoint. The agent must belong to the same business and the
 // tracking id is generated server-side.
-app.post('/v1/touchpoints', (req, res) => {
+app.post('/v1/touchpoints', asyncHandler(async (req, res) => {
   const body = req.body || {};
 
   const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -1334,7 +1364,7 @@ app.post('/v1/touchpoints', (req, res) => {
     return res.status(400).json({ error: 'agentId is required' });
   }
 
-  const agent = getAgentById(req.business.id, body.agentId);
+  const agent = await getAgentById(req.business.id, body.agentId);
   if (!agent) {
     return res.status(400).json({ error: 'The selected agent does not exist in this workspace' });
   }
@@ -1346,7 +1376,7 @@ app.post('/v1/touchpoints', (req, res) => {
 
   const plan = req.business.plan || 'Free';
   const limit = PLAN_LIMITS[plan] ? PLAN_LIMITS[plan].touchpoints : PLAN_LIMITS.Free.touchpoints;
-  if (countTouchpoints(req.business.id) >= limit) {
+  if (await countTouchpoints(req.business.id) >= limit) {
     return res.status(403).json({
       error: `Touchpoint limit reached: your ${plan} plan supports up to ${limit} touchpoint(s).`,
       code: 'PLAN_LIMIT_EXCEEDED',
@@ -1355,12 +1385,12 @@ app.post('/v1/touchpoints', (req, res) => {
 
   let trackingId;
   try {
-    trackingId = generateTrackingId();
+    trackingId = await generateTrackingId();
   } catch (err) {
     return res.status(500).json({ error: 'Could not allocate a tracking id' });
   }
 
-  const touchpoint = createTouchpoint({
+  const touchpoint = await createTouchpoint({
     businessId: req.business.id,
     agentId: agent.id,
     name,
@@ -1370,18 +1400,18 @@ app.post('/v1/touchpoints', (req, res) => {
   });
 
   res.status(201).json({ touchpoint: publicTouchpoint(touchpoint) });
-});
+}));
 
 // Get a single touchpoint (scoped to the authenticated business)
-app.get('/v1/touchpoints/:id', (req, res) => {
-  const touchpoint = getTouchpointById(req.business.id, req.params.id);
+app.get('/v1/touchpoints/:id', asyncHandler(async (req, res) => {
+  const touchpoint = await getTouchpointById(req.business.id, req.params.id);
   if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
   res.status(200).json({ touchpoint: publicTouchpoint(touchpoint) });
-});
+}));
 
 // Update a touchpoint (scoped to the authenticated business)
-app.put('/v1/touchpoints/:id', (req, res) => {
-  const existing = getTouchpointById(req.business.id, req.params.id);
+app.put('/v1/touchpoints/:id', asyncHandler(async (req, res) => {
+  const existing = await getTouchpointById(req.business.id, req.params.id);
   if (!existing) return res.status(404).json({ error: 'Touchpoint not found' });
 
   const body = req.body || {};
@@ -1401,7 +1431,7 @@ app.put('/v1/touchpoints/:id', (req, res) => {
     if (typeof body.agentId !== 'string' || !body.agentId) {
       return res.status(400).json({ error: 'agentId must be a valid id' });
     }
-    const agent = getAgentById(req.business.id, body.agentId);
+    const agent = await getAgentById(req.business.id, body.agentId);
     if (!agent) {
       return res.status(400).json({ error: 'The selected agent does not exist in this workspace' });
     }
@@ -1417,17 +1447,17 @@ app.put('/v1/touchpoints/:id', (req, res) => {
     return res.status(400).json({ error: 'active must be a boolean' });
   }
 
-  const updated = updateTouchpoint(req.business.id, req.params.id, body);
+  const updated = await updateTouchpoint(req.business.id, req.params.id, body);
   res.status(200).json({ touchpoint: publicTouchpoint(updated) });
-});
+}));
 
 // Delete a touchpoint (scoped to the authenticated business)
-app.delete('/v1/touchpoints/:id', (req, res) => {
-  if (!deleteTouchpoint(req.business.id, req.params.id)) {
+app.delete('/v1/touchpoints/:id', asyncHandler(async (req, res) => {
+  if (!await deleteTouchpoint(req.business.id, req.params.id)) {
     return res.status(404).json({ error: 'Touchpoint not found' });
   }
   res.status(200).json({ success: true });
-});
+}));
 
 /**
  * PUBLIC TOUCHPOINT CHAT (Phase 4)
@@ -1443,9 +1473,9 @@ app.delete('/v1/touchpoints/:id', (req, res) => {
 
 const TRACKING_ID_RE = /^TX-[0-9a-f]{16}$/i;
 
-function resolvePublicTouchpoint(trackingId) {
+async function resolvePublicTouchpoint(trackingId) {
   if (typeof trackingId !== 'string' || !TRACKING_ID_RE.test(trackingId)) return null;
-  return getTouchpointByTrackingId(trackingId);
+  return await getTouchpointByTrackingId(trackingId);
 }
 
 const publicTouchpointInfo = (touchpoint) => ({
@@ -1509,25 +1539,25 @@ function renderPublicPage(payload) {
 // Resolve a tracking id to its public info. A scan is NOT recorded here; only
 // the HTML page route counts as a physical scan so a single page load is never
 // double-counted by the page's own JSON fetch.
-app.get('/v1/t/:trackingId', (req, res) => {
-  const touchpoint = resolvePublicTouchpoint(req.params.trackingId);
+app.get('/v1/t/:trackingId', asyncHandler(async (req, res) => {
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
   if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
   if (!touchpoint.active) return res.status(410).json({ error: 'This touchpoint is no longer active' });
   res.json(publicTouchpointInfo(touchpoint));
-});
+}));
 
 // Fetch a conversation's message history so a returning customer can resume.
 // The conversation id is only honored if it belongs to the touchpoint named by
 // the tracking id in the URL — cross-touchpoint/cross-tenant ids get 404.
-app.get('/v1/t/:trackingId/messages', (req, res) => {
-  const touchpoint = resolvePublicTouchpoint(req.params.trackingId);
+app.get('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
   if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
   if (!touchpoint.active) return res.status(410).json({ error: 'This touchpoint is no longer active' });
 
   const conversationId = typeof req.query.conversationId === 'string' ? req.query.conversationId : '';
   if (!conversationId) return res.json({ conversationId: null, messages: [] });
 
-  const conversation = getConversationById(conversationId);
+  const conversation = await getConversationById(conversationId);
   if (!conversation || conversation.touchpoint_id !== touchpoint.id) {
     return res.status(404).json({ error: 'Conversation not found' });
   }
@@ -1536,15 +1566,15 @@ app.get('/v1/t/:trackingId/messages', (req, res) => {
     conversationId: conversation.id,
     customerName: conversation.customer_name || null,
     targetLanguage: conversation.target_language,
-    messages: listConversationMessages(conversation.id),
+    messages: await listConversationMessages(conversation.id),
   });
-});
+}));
 
 // Send a message in a public touchpoint conversation. Creates the conversation
 // on first contact, persists both sides of the exchange, and drives the same
 // Groq logic as the authenticated sandbox.
 app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
-  const touchpoint = resolvePublicTouchpoint(req.params.trackingId);
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
   if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
   if (!touchpoint.active) return res.status(410).json({ error: 'This touchpoint is no longer active' });
 
@@ -1584,7 +1614,7 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
     if (typeof body.conversationId !== 'string') {
       return res.status(400).json({ error: 'conversationId must be a string' });
     }
-    conversation = getConversationById(body.conversationId);
+    conversation = await getConversationById(body.conversationId);
     // The conversation must belong to THIS touchpoint — otherwise the tracking
     // id becomes an oracle for another tenant's conversations.
     if (!conversation || conversation.touchpoint_id !== touchpoint.id) {
@@ -1593,7 +1623,7 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
   }
 
   if (!conversation) {
-    conversation = createConversation({
+    conversation = await createConversation({
       touchpoint,
       agentId: touchpoint.agent_id,
       customerName,
@@ -1601,12 +1631,12 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
     });
   }
 
-  const agent = getAgentById(touchpoint.business_id, touchpoint.agent_id);
+  const agent = await getAgentById(touchpoint.business_id, touchpoint.agent_id);
   if (!agent) {
     return res.status(500).json({ error: 'The assigned agent is unavailable' });
   }
 
-  const history = listConversationMessages(conversation.id);
+  const history = await listConversationMessages(conversation.id);
   let replyText;
   try {
     replyText = await runAgentChat({
@@ -1627,8 +1657,8 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
     replyText = AI_FALLBACK_REPLY;
   }
 
-  addConversationMessage({ conversationId: conversation.id, role: 'user', text: message });
-  addConversationMessage({ conversationId: conversation.id, role: 'assistant', text: replyText });
+  await addConversationMessage({ conversationId: conversation.id, role: 'user', text: message });
+  await addConversationMessage({ conversationId: conversation.id, role: 'assistant', text: replyText });
 
   // Phase 5: extract and persist a lead from the exchange. Failures here are
   // logged and swallowed so a transient AI hiccup never breaks the chat.
@@ -1638,13 +1668,13 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
     console.error('[Lead Capture] Extraction error:', error);
   }
 
-  const fresh = getConversationById(conversation.id);
+  const fresh = await getConversationById(conversation.id);
   res.json({
     conversationId: conversation.id,
     customerName: fresh.customer_name || null,
     targetLanguage: fresh.target_language,
     agent: { name: fresh.agent_name },
-    messages: listConversationMessages(conversation.id),
+    messages: await listConversationMessages(conversation.id),
   });
 }));
 
@@ -1677,8 +1707,8 @@ app.get('/t/:trackingId', (req, res) => {
 });
 
 // Authenticated dashboard: list the business's persisted conversations.
-app.get('/v1/conversations', (req, res) => {
-  const conversations = listConversations(req.business.id).map((c) => ({
+app.get('/v1/conversations', asyncHandler(async (req, res) => {
+  const conversations = (await listConversations(req.business.id)).map((c) => ({
     id: c.id,
     touchpointId: c.touchpoint_id,
     touchpointName: c.touchpoint_name,
@@ -1692,7 +1722,7 @@ app.get('/v1/conversations', (req, res) => {
     updatedAt: c.updated_at,
   }));
   res.status(200).json({ conversations });
-});
+}));
 
 /**
  * LEADS & NOTIFICATIONS (Phase 5)
@@ -1733,28 +1763,28 @@ const publicLeadNotification = (n) => ({
 });
 
 // List the authenticated business's leads, newest activity first.
-app.get('/v1/leads', (req, res) => {
-  res.status(200).json({ leads: listLeads(req.business.id).map(publicLead) });
-});
+app.get('/v1/leads', asyncHandler(async (req, res) => {
+  res.status(200).json({ leads: (await listLeads(req.business.id)).map(publicLead) });
+}));
 
 // In-app notifications for newly qualified leads (unread first).
-app.get('/v1/leads/notifications', (req, res) => {
-  const notifications = listLeadNotifications(req.business.id).map(publicLeadNotification);
+app.get('/v1/leads/notifications', asyncHandler(async (req, res) => {
+  const notifications = (await listLeadNotifications(req.business.id)).map(publicLeadNotification);
   res.status(200).json({
     notifications,
-    unread: countUnreadLeadNotifications(req.business.id),
+    unread: await countUnreadLeadNotifications(req.business.id),
   });
-});
+}));
 
 // Mark the business's lead notifications as read.
-app.post('/v1/leads/notifications/read', (req, res) => {
-  const marked = markLeadNotificationsRead(req.business.id);
+app.post('/v1/leads/notifications/read', asyncHandler(async (req, res) => {
+  const marked = await markLeadNotificationsRead(req.business.id);
   res.status(200).json({ success: true, marked, unread: 0 });
-});
+}));
 
 // Create a lead manually (e.g. a salesperson logging a call). Plan limit is
 // enforced server-side using the shared PLAN_LIMITS architecture.
-app.post('/v1/leads', (req, res) => {
+app.post('/v1/leads', asyncHandler(async (req, res) => {
   const body = req.body || {};
 
   const name = cleanString(body.name, 120);
@@ -1808,7 +1838,7 @@ app.post('/v1/leads', (req, res) => {
     if (typeof body.conversationId !== 'string') {
       return res.status(400).json({ error: 'conversationId must be a string' });
     }
-    const conversation = getConversationById(body.conversationId);
+    const conversation = await getConversationById(body.conversationId);
     if (!conversation || conversation.business_id !== req.business.id) {
       return res.status(400).json({ error: 'The referenced conversation does not exist in this workspace' });
     }
@@ -1820,7 +1850,7 @@ app.post('/v1/leads', (req, res) => {
     if (typeof body.touchpointId !== 'string') {
       return res.status(400).json({ error: 'touchpointId must be a string' });
     }
-    const touchpoint = getTouchpointById(req.business.id, body.touchpointId);
+    const touchpoint = await getTouchpointById(req.business.id, body.touchpointId);
     if (!touchpoint) {
       return res.status(400).json({ error: 'The referenced touchpoint does not exist in this workspace' });
     }
@@ -1838,23 +1868,29 @@ app.post('/v1/leads', (req, res) => {
     qualificationScore = qualificationStatus === 'qualified' ? 60 : 0;
   }
 
-  if (conversationId && findLeadByConversation(req.business.id, conversationId)) {
+  if (conversationId && await findLeadByConversation(req.business.id, conversationId)) {
     return res.status(409).json({ error: 'A lead already exists for this conversation' });
   }
 
   const limits = PLAN_LIMITS[req.business.plan || 'Free'] || PLAN_LIMITS.Free;
-  if (countLeads(req.business.id) >= limits.leads) {
+  if (await countLeads(req.business.id) >= limits.leads) {
     return res.status(403).json({
       error: `Lead limit reached: your ${req.business.plan || 'Free'} plan supports up to ${limits.leads} lead(s).`,
       code: 'PLAN_LIMIT_EXCEEDED',
     });
   }
 
-  const lead = createLead({
+  let agentId = null;
+  if (conversationId) {
+    const conv = await getConversationById(conversationId);
+    agentId = conv.agent_id;
+  }
+
+  const lead = await createLead({
     businessId: req.business.id,
     touchpointId,
     conversationId,
-    agentId: conversationId ? getConversationById(conversationId).agent_id : null,
+    agentId,
     name,
     phone,
     email,
@@ -1865,23 +1901,23 @@ app.post('/v1/leads', (req, res) => {
   });
 
   if (lead.qualification_status === 'qualified' && !lead.notified) {
-    createLeadNotification({ businessId: req.business.id, leadId: lead.id });
+    await createLeadNotification({ businessId: req.business.id, leadId: lead.id });
   }
 
   res.status(201).json({ lead: publicLead(lead) });
-});
+}));
 
 // Get a single lead (scoped to the authenticated business)
-app.get('/v1/leads/:id', (req, res) => {
-  const lead = getLeadById(req.business.id, req.params.id);
+app.get('/v1/leads/:id', asyncHandler(async (req, res) => {
+  const lead = await getLeadById(req.business.id, req.params.id);
   if (!lead) return res.status(404).json({ error: 'Lead not found' });
   res.status(200).json({ lead: publicLead(lead) });
-});
+}));
 
 // Update a lead's contact/qualification fields (scoped to the authenticated
 // business). Qualification status is validated against the deterministic enum.
-app.put('/v1/leads/:id', (req, res) => {
-  const existing = getLeadById(req.business.id, req.params.id);
+app.put('/v1/leads/:id', asyncHandler(async (req, res) => {
+  const existing = await getLeadById(req.business.id, req.params.id);
   if (!existing) return res.status(404).json({ error: 'Lead not found' });
 
   const body = req.body || {};
@@ -1930,15 +1966,15 @@ app.put('/v1/leads/:id', (req, res) => {
     return res.status(200).json({ lead: publicLead(existing) });
   }
 
-  const updated = updateLead(req.business.id, req.params.id, updates);
+  const updated = await updateLead(req.business.id, req.params.id, updates);
   if (!updated) return res.status(404).json({ error: 'Lead not found' });
 
   if (updated.qualification_status === 'qualified' && !updated.notified) {
-    createLeadNotification({ businessId: req.business.id, leadId: updated.id });
+    await createLeadNotification({ businessId: req.business.id, leadId: updated.id });
   }
 
   res.status(200).json({ lead: publicLead(updated) });
-});
+}));
 
 /**
  * ANALYTICS (Phase 6)
@@ -2031,7 +2067,7 @@ function countByBucket(rows, labels) {
  * the window is present; counts are always derived from real rows, so a quiet
  * tenant gets zeros rather than fabricated activity.
  */
-function buildTrends(businessId, range) {
+async function buildTrends(businessId, range) {
   const window = analyticsWindow(range);
   const labels = bucketLabels(window.start, window.end, window.unit);
   const start = toSqliteDateTime(window.start);
@@ -2039,19 +2075,19 @@ function buildTrends(businessId, range) {
 
   const series = {
     scans: countByBucket(
-      analyticsBucketCounts(businessId, 'scans', { start, end, bucketExpr: window.bucketExpr }),
+      await analyticsBucketCounts(businessId, 'scans', { start, end, bucketExpr: window.bucketExpr }),
       labels,
     ),
     conversations: countByBucket(
-      analyticsBucketCounts(businessId, 'conversations', { start, end, bucketExpr: window.bucketExpr }),
+      await analyticsBucketCounts(businessId, 'conversations', { start, end, bucketExpr: window.bucketExpr }),
       labels,
     ),
     leads: countByBucket(
-      analyticsBucketCounts(businessId, 'leads', { start, end, bucketExpr: window.bucketExpr }),
+      await analyticsBucketCounts(businessId, 'leads', { start, end, bucketExpr: window.bucketExpr }),
       labels,
     ),
     qualifiedLeads: countByBucket(
-      analyticsBucketCounts(businessId, 'leads', { start, end, bucketExpr: window.bucketExpr, qualifiedOnly: true }),
+      await analyticsBucketCounts(businessId, 'leads', { start, end, bucketExpr: window.bucketExpr, qualifiedOnly: true }),
       labels,
     ),
   };
@@ -2071,7 +2107,7 @@ function buildTrends(businessId, range) {
 }
 
 // Summary + trend series for the whole workspace.
-app.get('/v1/analytics/overview', (req, res) => {
+app.get('/v1/analytics/overview', asyncHandler(async (req, res) => {
   const range = analyticsRangeParam(req);
   if (!range) {
     return res.status(400).json({ error: `range must be one of: ${ANALYTICS_RANGES.join(', ')}` });
@@ -2083,10 +2119,10 @@ app.get('/v1/analytics/overview', (req, res) => {
 
   if (range === 'all') {
     for (const source of ANALYTICS_SUMMARY_SOURCES) {
-      totals[source] = countAnalyticsRows(req.business.id, source);
+      totals[source] = await countAnalyticsRows(req.business.id, source);
       deltas[source] = null;
     }
-    totals.qualifiedLeads = countAnalyticsRows(req.business.id, 'leads', { qualifiedOnly: true });
+    totals.qualifiedLeads = await countAnalyticsRows(req.business.id, 'leads', { qualifiedOnly: true });
     deltas.qualifiedLeads = null;
   } else {
     const window = analyticsWindow(range);
@@ -2095,18 +2131,18 @@ app.get('/v1/analytics/overview', (req, res) => {
     const prevStart = toSqliteDateTime(window.prevStart);
 
     for (const source of ANALYTICS_SUMMARY_SOURCES) {
-      totals[source] = countAnalyticsRows(req.business.id, source, { start, end });
+      totals[source] = await countAnalyticsRows(req.business.id, source, { start, end });
       deltas[source] = pctChange(
         totals[source],
-        countAnalyticsRows(req.business.id, source, { start: prevStart, end: start }),
+        await countAnalyticsRows(req.business.id, source, { start: prevStart, end: start }),
       );
     }
-    totals.qualifiedLeads = countAnalyticsRows(req.business.id, 'leads', { start, end, qualifiedOnly: true });
+    totals.qualifiedLeads = await countAnalyticsRows(req.business.id, 'leads', { start, end, qualifiedOnly: true });
     deltas.qualifiedLeads = pctChange(
       totals.qualifiedLeads,
-      countAnalyticsRows(req.business.id, 'leads', { start: prevStart, end: start, qualifiedOnly: true }),
+      await countAnalyticsRows(req.business.id, 'leads', { start: prevStart, end: start, qualifiedOnly: true }),
     );
-    trends = buildTrends(req.business.id, range);
+    trends = await buildTrends(req.business.id, range);
   }
 
   const qualificationRate = totals.leads > 0
@@ -2114,7 +2150,7 @@ app.get('/v1/analytics/overview', (req, res) => {
     : 0;
 
   res.json({ range, totals, deltas, qualificationRate, trends });
-});
+}));
 
 // Per-touchpoint performance: real scans, conversations, leads and qualified
 // leads for every node in the workspace (quiet nodes report honest zeros).
