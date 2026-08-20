@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Loader2, Lock, Mail, User, Building2, Eye, EyeOff, ShieldCheck, Sparkles } from 'lucide-react';
+import { Loader2, Lock, Mail, User, Building2, Eye, EyeOff, ShieldCheck, Sparkles, ArrowLeft } from 'lucide-react';
 import { AuthResponse } from '../types';
 import { authService } from '../services/auth';
 
@@ -8,7 +8,7 @@ interface Props {
   onAuthenticated: (auth: AuthResponse) => void;
 }
 
-type Mode = 'login' | 'register';
+type Mode = 'login' | 'register' | 'forgot-password' | 'reset-password';
 
 const inputClass =
   'w-full px-5 py-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-bold text-slate-700 placeholder:text-slate-300 transition-all';
@@ -17,12 +17,23 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [name, setName] = useState('');
   const [businessName, setBusinessName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [verificationSent, setVerificationSent] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tokenParam = params.get('token');
+    if (tokenParam) {
+      setMode('reset-password');
+      setToken(tokenParam);
+    }
+  }, []);
 
   const switchMode = (next: Mode) => {
     setMode(next);
@@ -31,11 +42,18 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
   };
 
   const validate = (): string | null => {
-    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      return 'Enter a valid email address.';
+    if (mode === 'forgot-password' || mode === 'login' || mode === 'register') {
+      if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return 'Enter a valid email address.';
+      }
     }
-    if (password.length < 8) {
-      return 'Password must be at least 8 characters.';
+    if (mode === 'login' || mode === 'register' || mode === 'reset-password') {
+      if (password.length < 8) {
+        return 'Password must be at least 8 characters.';
+      }
+      if (mode === 'reset-password' && password !== confirmPassword) {
+        return 'Passwords do not match.';
+      }
     }
     if (mode === 'register') {
       if (name.trim().length < 2) return 'Enter your name.';
@@ -58,9 +76,15 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
       if (mode === 'register') {
         await authService.register({ email, password, name, businessName });
         setVerificationSent(true);
-      } else {
+      } else if (mode === 'login') {
         const auth = await authService.login({ email, password });
         onAuthenticated(auth);
+      } else if (mode === 'forgot-password') {
+        await authService.forgotPassword(email);
+        setVerificationSent(true);
+      } else if (mode === 'reset-password' && token) {
+        await authService.resetPassword(token, password);
+        switchMode('login');
       }
     } catch (err: any) {
       setError(err.message || 'Something went wrong. Please try again.');
@@ -129,34 +153,40 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
                 exit={{ opacity: 0, y: -20 }}
               >
                 {/* Toggle */}
-                <div className="grid grid-cols-2 gap-2 bg-slate-50 p-2 rounded-2xl mb-8">
-                  <button
-                    type="button"
-                    onClick={() => switchMode('login')}
-                    className={`py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all ${
-                      mode === 'login' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-700'
-                    }`}
-                  >
-                    Sign In
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => switchMode('register')}
-                    className={`py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all ${
-                      mode === 'register' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-700'
-                    }`}
-                  >
-                    Create Workspace
-                  </button>
-                </div>
+                {['login', 'register'].includes(mode) && (
+                  <div className="grid grid-cols-2 gap-2 bg-slate-50 p-2 rounded-2xl mb-8">
+                    <button
+                      type="button"
+                      onClick={() => switchMode('login')}
+                      className={`py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all ${
+                        mode === 'login' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-700'
+                      }`}
+                    >
+                      Sign In
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchMode('register')}
+                      className={`py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all ${
+                        mode === 'register' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-700'
+                      }`}
+                    >
+                      Create Workspace
+                    </button>
+                  </div>
+                )}
 
                 <h2 className="text-xl font-bold text-slate-900 mb-1">
-                  {mode === 'login' ? 'Welcome back' : 'Provision your business'}
+                  {mode === 'login' ? 'Welcome back'
+                    : mode === 'register' ? 'Provision your business'
+                    : mode === 'forgot-password' ? 'Reset your password'
+                    : 'Set new password'}
                 </h2>
                 <p className="text-sm text-slate-400 font-medium mb-8">
-                  {mode === 'login'
-                    ? 'Access your agents, touchpoints and pipeline.'
-                    : 'Create your workspace to start training agents.'}
+                  {mode === 'login' ? 'Access your agents, touchpoints and pipeline.'
+                    : mode === 'register' ? 'Create your workspace to start training agents.'
+                    : mode === 'forgot-password' ? 'Enter your email to receive a reset link.'
+                    : 'Enter and confirm your new password.'}
                 </p>
 
                 <form onSubmit={handleSubmit} className="space-y-4">
@@ -193,43 +223,69 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
                     </>
                   )}
 
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Email</label>
-                    <div className="relative">
-                      <Mail size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" />
-                      <input
-                        type="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        placeholder="you@company.com"
-                        className={`${inputClass} pl-12`}
-                        autoComplete="email"
-                      />
+                  {['login', 'register', 'forgot-password'].includes(mode) && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Email</label>
+                      <div className="relative">
+                        <Mail size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" />
+                        <input
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="you@company.com"
+                          className={`${inputClass} pl-12`}
+                          autoComplete="email"
+                        />
+                      </div>
                     </div>
-                  </div>
+                  )}
 
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Password</label>
-                    <div className="relative">
-                      <Lock size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" />
-                      <input
-                        type={showPassword ? 'text' : 'password'}
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        placeholder="Minimum 8 characters"
-                        className={`${inputClass} pl-12 pr-12`}
-                        autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(!showPassword)}
-                        className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-300 hover:text-slate-500 transition-colors"
-                        tabIndex={-1}
-                      >
-                        {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                      </button>
+                  {['login', 'register', 'reset-password'].includes(mode) && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between px-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Password</label>
+                        {mode === 'login' && (
+                          <button type="button" onClick={() => switchMode('forgot-password')} className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800">Forgot password?</button>
+                        )}
+                      </div>
+                      <div className="relative">
+                        <Lock size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" />
+                        <input
+                          type={showPassword ? 'text' : 'password'}
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder={mode === 'reset-password' ? "Minimum 8 characters" : "Password"}
+                          className={`${inputClass} pl-12 pr-12`}
+                          autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPassword(!showPassword)}
+                          className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-300 hover:text-slate-500 transition-colors"
+                          tabIndex={-1}
+                        >
+                          {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
+
+                  {mode === 'reset-password' && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Confirm Password</label>
+                      <div className="relative">
+                        <Lock size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" />
+                        <input
+                          type={showPassword ? 'text' : 'password'}
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          placeholder="Confirm password"
+                          className={`${inputClass} pl-12`}
+                          autoComplete="new-password"
+                        />
+                      </div>
+                    </div>
+                  )}
 
                   {error && (
                     <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-xs font-bold animate-in fade-in duration-300">
@@ -247,9 +303,18 @@ const AuthPage: React.FC<Props> = ({ onAuthenticated }) => {
                     ) : (
                       <Sparkles size={16} className="text-indigo-400" />
                     )}
-                    {mode === 'login' ? 'Sign In' : 'Create Workspace'}
+                    {mode === 'login' ? 'Sign In'
+                      : mode === 'register' ? 'Create Workspace'
+                      : mode === 'forgot-password' ? 'Send Reset Link'
+                      : 'Update Password'}
                   </button>
+                  {mode !== 'login' && mode !== 'register' && (
+                    <button type="button" onClick={() => switchMode('login')} className="w-full flex items-center justify-center gap-2 text-xs font-bold text-slate-400 hover:text-slate-600 mt-4">
+                      <ArrowLeft size={14} /> Back to Login
+                    </button>
+                  )}
                 </form>
+
               </motion.div>
             )}
           </AnimatePresence>

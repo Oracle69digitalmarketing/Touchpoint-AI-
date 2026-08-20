@@ -862,3 +862,45 @@ export async function analyticsGroupedCounts(businessId, source, { start = null,
   );
   return res.rows.map((row) => ({ id: row.id, count: parseInt(row.n, 10) }));
 }
+
+/**
+ * PASSWORD RESET STORAGE
+ */
+
+export async function createResetToken({ userId, tokenHash, expiresAt }) {
+  const id = crypto.randomUUID();
+  await pool.query(
+    'INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)',
+    [id, userId, tokenHash, expiresAt]
+  );
+  return id;
+}
+
+export async function findResetToken(tokenHash) {
+  const res = await pool.query(
+    'SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP',
+    [tokenHash]
+  );
+  return res.rows[0] || null;
+}
+
+export async function consumeResetToken(id) {
+  await pool.query(
+    'UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = $1',
+    [id]
+  );
+}
+
+export async function invalidateUserTokens(userId) {
+  await pool.query(
+    'UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND used_at IS NULL',
+    [userId]
+  );
+}
+
+export async function updateUserPassword(userId, passwordHash) {
+  await pool.query(
+    'UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+    [passwordHash, userId]
+  );
+}
