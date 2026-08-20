@@ -14,13 +14,9 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-analytics-test-'));
-process.env.DATA_DIR = DATA_DIR;
 process.env.JWT_SECRET = 'test-secret-for-phase6-analytics-smoke';
 process.env.GROQ_API_KEY = 'gsk_test_dummy';
 process.env.PAYSTACK_SECRET_KEY = 'sk_test_dummy';
@@ -32,6 +28,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // The /t/:trackingId route renders dist/t.html with an injected payload. If
 // the production build has not produced it yet, provide an equivalent fixture
 // so scan recording stays testable on its own.
+import fs from 'node:fs';
 const serverDistDir = path.join(__dirname, '..', 'dist');
 fs.mkdirSync(serverDistDir, { recursive: true });
 const tHtmlPath = path.join(serverDistDir, 't.html');
@@ -42,15 +39,19 @@ if (!fs.existsSync(tHtmlPath)) {
   );
 }
 
+import { setupTestDb, cleanupTestDb } from './helpers/test-db.js';
+
+const testPool = await setupTestDb();
+
 const { default: app, _setGroqClient } = await import(path.join(__dirname, '..', 'server.js'));
 
 const server = app.listen(0);
 await new Promise((resolve) => server.once('listening', resolve));
 const base = `http://localhost:${server.address().port}`;
 
-after(() => {
+after(async () => {
   server.close();
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  await cleanupTestDb(testPool);
 });
 
 const request = async (url, { method = 'GET', body, token, raw = false } = {}) => {
@@ -114,42 +115,38 @@ const setExtraction = (extract) => {
 };
 
 /**
- * Opens a second connection to the test database so backdated rows can be
- * seeded directly (the public API timestamps everything "now", which is not
- * enough to prove 7d/30d windowing).
+ * Seeds backdated rows directly into PostgreSQL using the shared pool.
  */
-const Database = (await import('better-sqlite3')).default;
-const db = new Database(path.join(DATA_DIR, 'touchpoint.db'));
-
 const DAY_MS = 24 * 60 * 60 * 1000;
-const sqliteDate = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+const pgTimestamp = (ms) => new Date(ms).toISOString();
 
-const seedBackdated = ({ businessId, touchpointId, agentId, daysAgo }) => {
-  const when = sqliteDate(Date.now() - daysAgo * DAY_MS);
+const seedBackdated = async ({ businessId, touchpointId, agentId, daysAgo }) => {
+  const when = pgTimestamp(Date.now() - daysAgo * DAY_MS);
 
-  const insertScan = db.prepare(
-    'INSERT INTO touchpoint_scans (id, touchpoint_id, business_id, user_agent, created_at) VALUES (?, ?, ?, ?, ?)'
+  await testPool.query(
+    'INSERT INTO touchpoint_scans (id, touchpoint_id, business_id, user_agent, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [crypto.randomUUID(), touchpointId, businessId, 'backdated-seed', when]
   );
-  insertScan.run(crypto.randomUUID(), touchpointId, businessId, 'backdated-seed', when);
-  insertScan.run(crypto.randomUUID(), touchpointId, businessId, 'backdated-seed', when);
+  await testPool.query(
+    'INSERT INTO touchpoint_scans (id, touchpoint_id, business_id, user_agent, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [crypto.randomUUID(), touchpointId, businessId, 'backdated-seed', when]
+  );
 
-  const insertConversation = db.prepare(
-    'INSERT INTO conversations (id, business_id, touchpoint_id, agent_id, customer_name, target_language, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  );
-  const insertLead = db.prepare(
-    `INSERT INTO leads (id, business_id, touchpoint_id, conversation_id, agent_id, name, phone, email, intent,
-       qualification_score, qualification_status, source, notified, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  // Each lead gets its own conversation so the unique conversation_id lead
-  // index stays valid.
   for (const lead of [
-    { name: 'Old Qualified', score: 80, status: 'qualified', notified: 1 },
-    { name: 'Old Pending', score: 40, status: 'pending', notified: 0 },
+    { name: 'Old Qualified', score: 80, status: 'qualified', notified: true },
+    { name: 'Old Pending', score: 40, status: 'pending', notified: false },
   ]) {
     const conversationId = crypto.randomUUID();
-    insertConversation.run(conversationId, businessId, touchpointId, agentId, lead.name, 'en', when, when);
-    insertLead.run(crypto.randomUUID(), businessId, touchpointId, conversationId, agentId, lead.name, null, null, 'History', lead.score, lead.status, 'auto', lead.notified, when, when);
+    await testPool.query(
+      'INSERT INTO conversations (id, business_id, touchpoint_id, agent_id, customer_name, target_language, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+      [conversationId, businessId, touchpointId, agentId, lead.name, 'en', when, when]
+    );
+    await testPool.query(
+      `INSERT INTO leads (id, business_id, touchpoint_id, conversation_id, agent_id, name, phone, email, intent,
+         qualification_score, qualification_status, source, notified, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      [crypto.randomUUID(), businessId, touchpointId, conversationId, agentId, lead.name, null, null, 'History', lead.score, lead.status, 'auto', lead.notified, when, when]
+    );
   }
 };
 
@@ -327,7 +324,7 @@ test('7d and 30d windows are scoped correctly against backdated rows', async () 
 
   // Backdated (10 days ago) scans, conversations, and leads belong to the
   // tenant but fall outside the 7-day window.
-  seedBackdated({
+  await seedBackdated({
     businessId: ranges.business.id,
     touchpointId: ranges.tp.id,
     agentId: ranges.agent.id,

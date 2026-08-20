@@ -1,17 +1,17 @@
 /**
- * SQLITE PRODUCTION BACKUP (Phase 8)
+ * PostgreSQL backup via pg_dump
  *
- * Creates a consistent, point-in-time copy of the live touchpoint.db while the
- * server keeps running. Uses SQLite's online backup API (better-sqlite3
- * `db.backup`), which is safe with WAL: no downtime, no torn files.
+ * Dumps the database referenced by DATABASE_URL to a timestamped SQL file.
+ * Uses pg_dump (must be available in PATH) — no Node dependencies needed.
  *
  * Usage: node scripts/backup.js
  *
  * Env:
- *   DATA_DIR    - where the source touchpoint.db lives (defaults to ./data)
- *   BACKUP_DIR  - where backups are written (defaults to ./data/backups)
+ *   DATABASE_URL       - the full PostgreSQL connection string
+ *   BACKUP_DIR         - where backups are written (defaults to ./backups)
+ *   PG_DUMP_PATH       - optional path to pg_dump binary
  */
-import Database from 'better-sqlite3';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,42 +20,34 @@ import 'dotenv/config';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 
-const dataDir = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(root, 'data');
-const backupDir = process.env.BACKUP_DIR
-  ? path.resolve(process.env.BACKUP_DIR)
-  : path.join(dataDir, 'backups');
-
-const sourcePath = path.join(dataDir, 'touchpoint.db');
-
-if (!fs.existsSync(sourcePath)) {
-  console.error(`No database found at ${sourcePath}. Nothing to back up.`);
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  console.error('DATABASE_URL is not set. Cannot back up.');
   process.exit(1);
 }
+
+const backupDir = process.env.BACKUP_DIR
+  ? path.resolve(process.env.BACKUP_DIR)
+  : path.join(root, 'backups');
+
+const pgDump = process.env.PG_DUMP_PATH || 'pg_dump';
 
 fs.mkdirSync(backupDir, { recursive: true });
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-const destPath = path.join(backupDir, `touchpoint-${stamp}.db`);
+const destPath = path.join(backupDir, `touchpoint-${stamp}.sql`);
 
-// Open read-only so the backup never contends with the running server for the
-// write lock. backup() is async (page-by-page transfers on the event loop),
-// so the source connection must stay open until it resolves.
-const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
-try {
-  await source.backup(destPath);
-} finally {
-  source.close();
-}
+const cmd = `"${pgDump}" "${databaseUrl}" --no-owner --no-privileges --clean --if-exists > "${destPath}"`;
 
 try {
+  execSync(cmd, { stdio: 'pipe' });
   fs.chmodSync(destPath, 0o600);
+  console.log(`Backup written to ${destPath}`);
 } catch (err) {
-  // chmod is POSIX-only; a failed chmod is not fatal to the backup itself.
+  console.error('pg_dump failed:', err.stderr?.toString() || err.message);
+  try { fs.rmSync(destPath, { force: true }); } catch (_) {}
+  process.exit(1);
 }
-
-console.log(`Backup written to ${destPath}`);
 
 // Retention: keep the newest 14 backups so long-running deployments do not
 // accumulate unbounded copies. Only files matching the backup naming pattern
@@ -63,7 +55,7 @@ console.log(`Backup written to ${destPath}`);
 const retained = 14;
 const backups = fs
   .readdirSync(backupDir)
-  .filter((name) => /^touchpoint-.*\.db$/.test(name))
+  .filter((name) => /^touchpoint-.*\.sql$/.test(name))
   .map((name) => path.join(backupDir, name))
   .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
 

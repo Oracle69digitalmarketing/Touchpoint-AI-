@@ -20,14 +20,17 @@ CREATE TABLE IF NOT EXISTS businesses (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-  id            TEXT PRIMARY KEY,
-  business_id   TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-  email         TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  name          TEXT NOT NULL,
-  role          TEXT NOT NULL DEFAULT 'owner',
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  id                      TEXT PRIMARY KEY,
+  business_id             TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  email                   TEXT NOT NULL UNIQUE,
+  password_hash           TEXT NOT NULL,
+  name                    TEXT NOT NULL,
+  role                    TEXT NOT NULL DEFAULT 'owner',
+  email_verified          BOOLEAN NOT NULL DEFAULT FALSE,
+  verification_token      TEXT,
+  verification_expires_at TIMESTAMPTZ,
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -176,6 +179,15 @@ CREATE TABLE IF NOT EXISTS crm_connections (
   UNIQUE (business_id, provider_id)
 );
 
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 3. INDEXES
 
 CREATE INDEX IF NOT EXISTS idx_agents_business ON agents(business_id);
@@ -196,6 +208,8 @@ CREATE INDEX IF NOT EXISTS idx_leads_business_created ON leads(business_id, crea
 CREATE INDEX IF NOT EXISTS idx_paystack_tx_business ON paystack_transactions(business_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_subscription_code ON subscriptions(paystack_subscription_code);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_customer_code ON subscriptions(paystack_customer_code);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);
 
 -- 4. TRIGGER FOR UPDATED_AT (standard PostgreSQL pattern)
 

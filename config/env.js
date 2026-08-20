@@ -92,6 +92,9 @@ export function validateEnvironment(rawEnv = process.env) {
     if (!env.GROQ_API_KEY) {
       errors.push('GROQ_API_KEY is required in production (the Groq SDK refuses to start without it)');
     }
+    if (!env.DATABASE_URL) {
+      errors.push('DATABASE_URL is required in production (PostgreSQL connection string)');
+    }
     if (!env.PAYSTACK_SECRET_KEY) {
       errors.push('PAYSTACK_SECRET_KEY is required in production (billing, webhooks and identity resolution all depend on it)');
     }

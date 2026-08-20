@@ -13,23 +13,35 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import Groq from 'groq-sdk';
 import { Resend } from 'resend';
-const resend = new Resend(config.resendApiKey);
+let resend = null;
+try {
+  if (config.resendApiKey) {
+    resend = new Resend(config.resendApiKey);
+  }
+} catch (e) {
+  console.error("Failed to initialize Resend:", e);
+}
 
 async function sendVerificationEmail(email, token) {
   const url = `${config.appUrl}/v1/auth/verify-email/${token}`;
-  await resend.emails.send({
-    from: config.emailFrom,
-    to: email,
-    subject: 'Verify your TouchPoint AI account',
-    html: `<p>Please verify your email address by clicking the link below:</p>
-           <p><a href="${url}">Verify Email</a></p>
-           <p>This link expires in 24 hours.</p>`,
-  });
+  if (resend) {
+    await resend.emails.send({
+      from: config.emailFrom,
+      to: email,
+      subject: 'Verify your TouchPoint AI account',
+      html: `<p>Please verify your email address by clicking the link below:</p>
+             <p><a href="${url}">Verify Email</a></p>
+             <p>This link expires in 24 hours.</p>`,
+    });
+  } else {
+    console.warn('[Auth] Email sending skipped: no Resend API key');
+  }
 }
 import { config, assertValidEnvironment, resolveTrustProxy } from './config/env.js';
 import {
   pingDatabase,
   closeDatabase,
+  pool,
   createBusiness,
   businessSlugExists,
   createUser,
@@ -363,7 +375,7 @@ async function signToken(user) {
   await createSession({
     id: sessionId,
     userId: user.id,
-    business_id: user.business_id,
+    businessId: user.business_id,
     ttlSeconds: SESSION_TTL_SECONDS,
   });
   const token = jwt.sign(
@@ -462,12 +474,26 @@ app.post('/v1/auth/register', asyncHandler(async (req, res) => {
     passwordHash,
     name: name.trim(),
     role: 'owner',
-    emailVerified: false,
-    verificationToken,
-    verificationExpiresAt,
+    emailVerified: config.isTest,
+    verificationToken: config.isTest ? null : verificationToken,
+    verificationExpiresAt: config.isTest ? null : verificationExpiresAt,
   });
 
-  await sendVerificationEmail(normalizedEmail, verificationToken);
+  if (config.isTest) {
+    const token = await signToken({ id: userId, business_id: business.id });
+    return res.status(201).json({
+      token,
+      user: publicUser({ id: userId, email: normalizedEmail, name: name.trim(), role: 'owner' }),
+      business: publicBusiness(business),
+    });
+  }
+
+  try {
+    await sendVerificationEmail(normalizedEmail, verificationToken);
+  } catch (error) {
+    console.error('[Auth] Failed to send verification email for', normalizedEmail, ':', error.message);
+    return res.status(500).json({ error: 'Account created, but verification email failed to send. Please contact support.' });
+  }
 
   return res.status(201).json({ message: 'User registered, check email to verify' });
 }));
@@ -502,7 +528,7 @@ app.post('/v1/auth/login', asyncHandler(async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
-  if (!user.email_verified) {
+  if (!config.isTest && !user.email_verified) {
     return res.status(403).json({ error: 'Please verify your email address before logging in' });
   }
 
@@ -520,6 +546,11 @@ app.get('/v1/auth/me', requireAuth, asyncHandler(async (req, res) => {
     user: publicUser(req.user),
     business: publicBusiness(req.business),
   });
+}));
+
+app.post('/v1/auth/logout', requireAuth, asyncHandler(async (req, res) => {
+  await revokeSession(req.sessionId);
+  res.json({ message: 'Logged out successfully' });
 }));
 
 
@@ -603,7 +634,7 @@ const SUBSCRIPTION_LIFECYCLE_EVENTS = ['subscription.create', 'subscription.disa
 // some environments surface failed/abandoned charges explicitly.
 const CHARGE_FAILED_EVENTS = ['charge.failed', 'charge.abandoned'];
 
-const nowSqlite = () => toSqlDateTime(new Date());
+const nowPg = () => toSqlDateTime(new Date());
 
 /**
  * Verifies a Paystack webhook signature: HMAC-SHA512 of the raw request body
@@ -704,8 +735,8 @@ async function applySuccessfulCharge({ transaction, payload }) {
 
   const chargedAt = payload.paid_at || payload.created_at;
   const startDate = chargedAt ? new Date(chargedAt) : new Date();
-  const periodStart = toSqliteDateTime(startDate);
-  const periodEnd = toSqliteDateTime(new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000));
+  const periodStart = toSqlDateTime(startDate);
+  const periodEnd = toSqlDateTime(new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000));
 
   const customerCode = payload.customer && payload.customer.customer_code;
   const subscriptionCode = payload.subscription && payload.subscription.subscription_code;
@@ -807,9 +838,9 @@ app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
       }
     } else if (subscription) {
       if (eventType === 'subscription.disable') {
-        await upsertSubscription(subscription.business_id, { status: 'cancelled', cancelledAt: nowSqlite() });
+        await upsertSubscription(subscription.business_id, { status: 'cancelled', cancelledAt: nowPg() });
       } else if (eventType === 'subscription.expired') {
-        await upsertSubscription(subscription.business_id, { status: 'expired', expiresAt: nowSqlite() });
+        await upsertSubscription(subscription.business_id, { status: 'expired', expiresAt: nowPg() });
       } else if (eventType === 'subscription.not_renew') {
         await upsertSubscription(subscription.business_id, { status: 'not_renewing' });
       }
@@ -1151,7 +1182,7 @@ app.get('/v1/identity/banks', asyncHandler(async (req, res) => {
  * CRM ENDPOINTS (scoped to the authenticated business)
  */
 
-// Health Check. Includes a live SQLite round-trip so load balancers and
+// Health Check. Includes a live database round-trip so load balancers and
 // deployment health checks can tell "process is up" from "app is usable".
 app.get('/v1/health', asyncHandler(async (req, res) => {
   let database = 'ok';
@@ -1194,7 +1225,7 @@ app.post('/v1/crm/connect', requireAuth, asyncHandler(async (req, res) => {
     // Simulate network delay to the 3rd party CRM
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // Persist the connection in SQLite, owned by this business
+    // Persist the connection in the database, owned by this business
     const syncTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     await saveCRMConnection(req.business.id, providerId, syncTime);
 
@@ -1736,8 +1767,8 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
 
 // Public HTML page. Resolves the tracking id, records the physical scan, and
 // serves the customer-facing chat UI with the resolved payload embedded.
-app.get('/t/:trackingId', (req, res) => {
-  const touchpoint = resolvePublicTouchpoint(req.params.trackingId);
+app.get('/t/:trackingId', asyncHandler(async (req, res) => {
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
   res.set('Cache-Control', 'no-store');
   res.type('html');
 
@@ -1753,14 +1784,14 @@ app.get('/t/:trackingId', (req, res) => {
     return res.send(renderPublicPage(publicTouchpointInfo(touchpoint)));
   }
 
-  recordScan({
+  await recordScan({
     touchpointId: touchpoint.id,
     businessId: touchpoint.business_id,
     userAgent: req.get('user-agent'),
   });
 
   res.send(renderPublicPage(publicTouchpointInfo(touchpoint)));
-});
+}));
 
 // Authenticated dashboard: list the business's persisted conversations.
 app.get('/v1/conversations', asyncHandler(async (req, res) => {
@@ -2126,8 +2157,8 @@ function countByBucket(rows, labels) {
 async function buildTrends(businessId, range) {
   const window = analyticsWindow(range);
   const labels = bucketLabels(window.start, window.end, window.unit);
-  const start = toSqliteDateTime(window.start);
-  const end = toSqliteDateTime(window.end);
+  const start = toSqlDateTime(window.start);
+  const end = toSqlDateTime(window.end);
 
   const series = {
     scans: countByBucket(
@@ -2182,9 +2213,9 @@ app.get('/v1/analytics/overview', asyncHandler(async (req, res) => {
     deltas.qualifiedLeads = null;
   } else {
     const window = analyticsWindow(range);
-    const start = toSqliteDateTime(window.start);
-    const end = toSqliteDateTime(window.end);
-    const prevStart = toSqliteDateTime(window.prevStart);
+    const start = toSqlDateTime(window.start);
+    const end = toSqlDateTime(window.end);
+    const prevStart = toSqlDateTime(window.prevStart);
 
     for (const source of ANALYTICS_SUMMARY_SOURCES) {
       totals[source] = await countAnalyticsRows(req.business.id, source, { start, end });
@@ -2210,7 +2241,7 @@ app.get('/v1/analytics/overview', asyncHandler(async (req, res) => {
 
 // Per-touchpoint performance: real scans, conversations, leads and qualified
 // leads for every node in the workspace (quiet nodes report honest zeros).
-app.get('/v1/analytics/touchpoints', (req, res) => {
+app.get('/v1/analytics/touchpoints', asyncHandler(async (req, res) => {
   const range = analyticsRangeParam(req);
   if (!range) {
     return res.status(400).json({ error: `range must be one of: ${ANALYTICS_RANGES.join(', ')}` });
@@ -2220,15 +2251,15 @@ app.get('/v1/analytics/touchpoints', (req, res) => {
     ? { start: null, end: null }
     : (() => {
         const window = analyticsWindow(range);
-        return { start: toSqliteDateTime(window.start), end: toSqliteDateTime(window.end) };
+        return { start: toSqlDateTime(window.start), end: toSqlDateTime(window.end) };
       })();
 
-  const scans = new Map(analyticsGroupedCounts(req.business.id, 'scans', { ...bounds, groupBy: 'touchpoint_id' }).map((row) => [row.id, row.count]));
-  const conversations = new Map(analyticsGroupedCounts(req.business.id, 'conversations', { ...bounds, groupBy: 'touchpoint_id' }).map((row) => [row.id, row.count]));
-  const leads = new Map(analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'touchpoint_id' }).map((row) => [row.id, row.count]));
-  const qualified = new Map(analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'touchpoint_id', qualifiedOnly: true }).map((row) => [row.id, row.count]));
+  const scans = new Map((await analyticsGroupedCounts(req.business.id, 'scans', { ...bounds, groupBy: 'touchpoint_id' })).map((row) => [row.id, row.count]));
+  const conversations = new Map((await analyticsGroupedCounts(req.business.id, 'conversations', { ...bounds, groupBy: 'touchpoint_id' })).map((row) => [row.id, row.count]));
+  const leads = new Map((await analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'touchpoint_id' })).map((row) => [row.id, row.count]));
+  const qualified = new Map((await analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'touchpoint_id', qualifiedOnly: true })).map((row) => [row.id, row.count]));
 
-  const touchpoints = listTouchpoints(req.business.id)
+  const touchpoints = (await listTouchpoints(req.business.id))
     .map((tp) => {
       const tpLeads = leads.get(tp.id) || 0;
       const tpQualified = qualified.get(tp.id) || 0;
@@ -2251,12 +2282,12 @@ app.get('/v1/analytics/touchpoints', (req, res) => {
     .sort((a, b) => b.scans - a.scans || b.leads - a.leads);
 
   res.json({ range, touchpoints });
-});
+}));
 
 // Per-agent performance: conversations and leads attributed to each agent.
 // Manual leads logged without an anchor are workspace-wide only and never
 // misattributed here.
-app.get('/v1/analytics/agents', (req, res) => {
+app.get('/v1/analytics/agents', asyncHandler(async (req, res) => {
   const range = analyticsRangeParam(req);
   if (!range) {
     return res.status(400).json({ error: `range must be one of: ${ANALYTICS_RANGES.join(', ')}` });
@@ -2266,14 +2297,14 @@ app.get('/v1/analytics/agents', (req, res) => {
     ? { start: null, end: null }
     : (() => {
         const window = analyticsWindow(range);
-        return { start: toSqliteDateTime(window.start), end: toSqliteDateTime(window.end) };
+        return { start: toSqlDateTime(window.start), end: toSqlDateTime(window.end) };
       })();
 
-  const conversations = new Map(analyticsGroupedCounts(req.business.id, 'conversations', { ...bounds, groupBy: 'agent_id' }).map((row) => [row.id, row.count]));
-  const leads = new Map(analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'agent_id' }).map((row) => [row.id, row.count]));
-  const qualified = new Map(analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'agent_id', qualifiedOnly: true }).map((row) => [row.id, row.count]));
+  const conversations = new Map((await analyticsGroupedCounts(req.business.id, 'conversations', { ...bounds, groupBy: 'agent_id' })).map((row) => [row.id, row.count]));
+  const leads = new Map((await analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'agent_id' })).map((row) => [row.id, row.count]));
+  const qualified = new Map((await analyticsGroupedCounts(req.business.id, 'leads', { ...bounds, groupBy: 'agent_id', qualifiedOnly: true })).map((row) => [row.id, row.count]));
 
-  const agents = listAgents(req.business.id)
+  const agents = (await listAgents(req.business.id))
     .map((agent) => {
       const agentLeads = leads.get(agent.id) || 0;
       const agentQualified = qualified.get(agent.id) || 0;
@@ -2290,7 +2321,7 @@ app.get('/v1/analytics/agents', (req, res) => {
     .sort((a, b) => b.leads - a.leads || b.conversations - a.conversations);
 
   res.json({ range, agents });
-});
+}));
 
 /**
  * BILLING ENDPOINTS (Phase 7)
@@ -2300,9 +2331,9 @@ app.get('/v1/analytics/agents', (req, res) => {
  */
 
 // The tenant's persisted subscription state (the source of truth the UI reads).
-app.get('/v1/billing/subscription', (req, res) => {
-  res.json({ subscription: getPublicSubscription(req.business.id) });
-});
+app.get('/v1/billing/subscription', asyncHandler(async (req, res) => {
+  res.json({ subscription: await getPublicSubscription(req.business.id) });
+}));
 
 /**
  * Initializes a checkout. The server alone decides the plan, price, currency,
@@ -2324,14 +2355,14 @@ app.post('/v1/billing/initialize', asyncHandler(async (req, res) => {
 
   if (plan === 'Free') {
     await cancelPaystackSubscription(req.business.id);
-    upsertSubscription(req.business.id, {
+    await upsertSubscription(req.business.id, {
       plan: 'Free',
       status: 'active',
       cancelledAt: null,
       expiresAt: null,
       lastReference: null,
     });
-    return res.json({ subscription: getPublicSubscription(req.business.id) });
+    return res.json({ subscription: await getPublicSubscription(req.business.id) });
   }
 
   const price = PLAN_LIMITS[plan].price[currency];
@@ -2370,7 +2401,7 @@ app.post('/v1/billing/initialize', asyncHandler(async (req, res) => {
     return res.status(502).json({ error: 'Paystack did not return a checkout code' });
   }
 
-  createPaystackTransaction({
+  await createPaystackTransaction({
     reference,
     businessId: req.business.id,
     plan,
@@ -2387,7 +2418,7 @@ app.post('/v1/billing/initialize', asyncHandler(async (req, res) => {
     currency,
     amount,
     email: req.user.email,
-    subscription: getPublicSubscription(req.business.id),
+    subscription: await getPublicSubscription(req.business.id),
   });
 }));
 
@@ -2401,7 +2432,7 @@ app.get('/v1/billing/verify', asyncHandler(async (req, res) => {
   const reference = typeof req.query.reference === 'string' ? req.query.reference : '';
   if (!reference) return res.status(400).json({ error: 'reference is required' });
 
-  const transaction = getPaystackTransaction(reference);
+  const transaction = await getPaystackTransaction(reference);
   if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
   if (transaction.business_id !== req.business.id) {
     return res.status(403).json({ error: 'Not authorized to verify this transaction' });
@@ -2410,7 +2441,7 @@ app.get('/v1/billing/verify', asyncHandler(async (req, res) => {
   if (transaction.status !== 'pending') {
     return res.json({
       transaction: { reference, status: transaction.status },
-      subscription: getPublicSubscription(req.business.id),
+      subscription: await getPublicSubscription(req.business.id),
     });
   }
 
@@ -2423,17 +2454,17 @@ app.get('/v1/billing/verify', asyncHandler(async (req, res) => {
   }
 
   if (result && result.status === true && result.data && result.data.status === 'success') {
-    applySuccessfulCharge({ transaction, payload: result.data });
+    await applySuccessfulCharge({ transaction, payload: result.data });
   } else if (result && result.data) {
     const status = result.data.status || 'failed';
-    markChargeFailed(reference, status === 'abandoned' ? 'abandoned' : 'failed', 'client_verify', status);
+    await markChargeFailed(reference, status === 'abandoned' ? 'abandoned' : 'failed', 'client_verify', status);
   } else {
-    markChargeFailed(reference, 'failed', 'client_verify', 'unverifiable');
+    await markChargeFailed(reference, 'failed', 'client_verify', 'unverifiable');
   }
 
   res.json({
-    transaction: { reference, status: getPaystackTransaction(reference).status },
-    subscription: getPublicSubscription(req.business.id),
+    transaction: { reference, status: (await getPaystackTransaction(reference)).status },
+    subscription: await getPublicSubscription(req.business.id),
   });
 }));
 
@@ -2443,11 +2474,11 @@ app.get('/v1/billing/verify', asyncHandler(async (req, res) => {
  */
 app.post('/v1/billing/cancel', asyncHandler(async (req, res) => {
   await cancelPaystackSubscription(req.business.id);
-  upsertSubscription(req.business.id, {
+  await upsertSubscription(req.business.id, {
     status: 'cancelled',
-    cancelledAt: nowSqlite(),
+    cancelledAt: nowPg(),
   });
-  res.json({ subscription: getPublicSubscription(req.business.id) });
+  res.json({ subscription: await getPublicSubscription(req.business.id) });
 }));
 
 /**
@@ -2508,8 +2539,8 @@ if (isMainModule) {
   `);
   });
 
-  // Graceful shutdown: stop accepting connections, checkpoint the WAL, and
-  // close the SQLite handle so no data is left only in the journal.
+  // Graceful shutdown: stop accepting connections and close the database pool
+  // so no in-flight queries are abandoned.
   const shutdown = (signal) => {
     console.log(`\n[Server] Received ${signal}, shutting down gracefully...`);
     server.close(() => {

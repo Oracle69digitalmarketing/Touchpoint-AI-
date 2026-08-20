@@ -608,7 +608,7 @@ export async function listConversations(businessId) {
       (SELECT m.text FROM conversation_messages m
        WHERE m.conversation_id = c.id
        ORDER BY m.seq DESC LIMIT 1) AS last_message,
-      (SELECT COUNT(*) FROM conversation_messages m
+      (SELECT COUNT(*)::int FROM conversation_messages m
        WHERE m.conversation_id = c.id) AS message_count
     FROM conversations c
     JOIN touchpoints tp ON tp.id = c.touchpoint_id
