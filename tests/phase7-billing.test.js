@@ -17,13 +17,9 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-billing-test-'));
-process.env.DATA_DIR = DATA_DIR;
 process.env.JWT_SECRET = 'test-secret-for-phase7-billing-smoke';
 process.env.GROQ_API_KEY = 'gsk_test_dummy';
 process.env.PAYSTACK_SECRET_KEY = 'sk_test_dummy_phase7';
@@ -35,16 +31,20 @@ process.env.PAYSTACK_PLAN_CODE_GROWTH = 'PLN_test_growth';
 process.env.PAYSTACK_PLAN_CODE_BUSINESS = 'PLN_test_business';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+import { setupTestDb, cleanupTestDb } from './helpers/test-db.js';
+const testPool = await setupTestDb();
+
 const { default: app, _setPaystackClient, _setGroqClient } = await import(path.join(__dirname, '..', 'server.js'));
-const { upsertSubscription } = await import(path.join(__dirname, '..', 'db.js'));
+const { upsertSubscription } = await import(path.join(__dirname, '..', 'db-pg.js'));
 
 const server = app.listen(0);
 await new Promise((resolve) => server.once('listening', resolve));
 const base = `http://localhost:${server.address().port}`;
 
-after(() => {
+after(async () => {
   server.close();
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  await cleanupTestDb(testPool);
 });
 
 const request = async (url, { method = 'GET', body, token, rawBody, signature } = {}) => {
@@ -418,7 +418,7 @@ test('subscription.disable webhook cancels the tenant subscription', async () =>
 
 test('expired subscriptions resolve to Free', async () => {
   // Simulate a paid period that has ended by writing a past period end.
-  upsertSubscription(acmeBusinessId, {
+  await upsertSubscription(acmeBusinessId, {
     currentPeriodEnd: '2020-01-01 00:00:00',
     status: 'cancelled',
   });

@@ -13,17 +13,18 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-knowledge-limit-test-'));
-process.env.DATA_DIR = DATA_DIR;
+import { setupTestDb, cleanupTestDb } from './helpers/test-db.js';
+
 process.env.JWT_SECRET = 'test-secret-for-knowledge-base-limits';
 process.env.GROQ_API_KEY = 'gsk_test_dummy';
 process.env.PAYSTACK_SECRET_KEY = 'sk_test_dummy';
 process.env.APP_URL = 'https://app.example.test';
 process.env.NODE_ENV = 'test';
+
+const testPool = await setupTestDb();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const { default: app } = await import(path.join(__dirname, '..', 'server.js'));
@@ -32,9 +33,9 @@ const server = app.listen(0);
 await new Promise((resolve) => server.once('listening', resolve));
 const base = `http://localhost:${server.address().port}`;
 
-after(() => {
+after(async () => {
   server.close();
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  await cleanupTestDb(testPool);
 });
 
 const request = async (url, { method = 'GET', body, token } = {}) => {

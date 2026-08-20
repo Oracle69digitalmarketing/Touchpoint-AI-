@@ -2,10 +2,9 @@
  * PHASE 8 — RENDER / PRODUCTION DEPLOYMENT SMOKE TESTS
  *
  * Exercises the exact behaviors a Render deployment depends on, against the
- * real Express app with a fresh temporary DATA_DIR (proving the database
- * initializes on an empty persistent disk):
+ * real Express app with a fresh PostgreSQL test database:
  *
- *   - health endpoint (200 + live SQLite round-trip)
+ *   - health endpoint (200 + live database round-trip)
  *   - SPA serving from dist/ (build-dependent, skipped when not built)
  *   - unknown /v1 API routes return JSON 404, never the SPA shell
  *   - protected API endpoints return 401 without a session
@@ -13,7 +12,6 @@
  *   - Paystack webhook reachable WITHOUT normal auth, HMAC rejected on mismatch
  *   - restricted CORS origin handling
  *   - malformed JSON and oversized payloads fail safely
- *   - fresh-disk database init preserves WAL mode
  *   - the production dist/ contains no secret material
  *
  * Run with: NODE_ENV=test node --test tests/phase8-deploy.test.js
@@ -23,22 +21,20 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Fresh production-style data directory: proves the schema/migrations bootstrap
-// on an empty persistent disk (Render /data).
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-deploy-test-'));
-process.env.DATA_DIR = DATA_DIR;
 process.env.JWT_SECRET = 'deploy-test-secret-longer-than-thirty-two-chars';
 process.env.GROQ_API_KEY = 'gsk_test_dummy_deploy';
 process.env.PAYSTACK_SECRET_KEY = 'sk_test_dummy_deploy_phase8';
 process.env.APP_URL = 'https://touchpoint.example.test';
 process.env.CORS_ORIGIN = 'https://touchpoint.example.test';
 process.env.NODE_ENV = 'test';
+
+import { setupTestDb, cleanupTestDb } from './helpers/test-db.js';
+const testPool = await setupTestDb();
 
 const { default: app } = await import(path.join(__dirname, '..', 'server.js'));
 
@@ -49,9 +45,9 @@ const base = `http://localhost:${server.address().port}`;
 const distDir = path.join(__dirname, '..', 'dist');
 const hasBuild = fs.existsSync(path.join(distDir, 'index.html'));
 
-after(() => {
+after(async () => {
   server.close();
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  await cleanupTestDb(testPool);
 });
 
 const request = async (url, { method = 'GET', body, rawBody, signature, token, origin } = {}) => {
@@ -73,7 +69,7 @@ const request = async (url, { method = 'GET', body, rawBody, signature, token, o
 
 const register = (payload) => request('/v1/auth/register', { method: 'POST', body: payload });
 
-test('health endpoint returns 200 with a live SQLite round-trip and security headers', async () => {
+test('health endpoint returns 200 with a live database round-trip and security headers', async () => {
   const res = await request('/v1/health');
   assert.equal(res.status, 200);
   assert.equal(res.body.status, 'healthy');
@@ -86,25 +82,16 @@ test('health endpoint returns 200 with a live SQLite round-trip and security hea
   assert.equal(res.headers.get('x-powered-by'), null, 'X-Powered-By is disabled');
 });
 
-test('database initializes from an empty data directory and preserves WAL mode', async () => {
-  const dbPath = path.join(DATA_DIR, 'touchpoint.db');
-  assert.ok(fs.existsSync(dbPath), 'touchpoint.db was created on the fresh disk');
-
-  const { default: Database } = await import('better-sqlite3');
-  const probe = new Database(dbPath, { readonly: true });
-  try {
-    assert.equal(probe.pragma('journal_mode', { simple: true }), 'wal', 'WAL mode preserved');
-    assert.equal(probe.pragma('integrity_check', { simple: true }), 'ok');
-    const tables = probe.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-    ).all().map((row) => row.name);
-    for (const expected of ['businesses', 'users', 'sessions', 'agents', 'touchpoints',
-      'touchpoint_scans', 'conversations', 'conversation_messages', 'leads',
-      'lead_notifications', 'subscriptions', 'paystack_transactions', 'webhook_events']) {
-      assert.ok(tables.includes(expected), `schema contains ${expected}`);
-    }
-  } finally {
-    probe.close();
+test('database initializes and all expected tables exist', async () => {
+  const result = await testPool.query(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+  );
+  const tables = result.rows.map((r) => r.table_name);
+  for (const expected of ['businesses', 'users', 'sessions', 'agents', 'touchpoints',
+    'touchpoint_scans', 'conversations', 'conversation_messages', 'leads',
+    'lead_notifications', 'subscriptions', 'paystack_transactions', 'webhook_events',
+    'crm_connections', 'password_reset_tokens']) {
+    assert.ok(tables.includes(expected), `schema contains ${expected}`);
   }
 });
 

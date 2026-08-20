@@ -1,9 +1,10 @@
 # Render Blueprint — Touchpoint AI
 #
-# Deploys the existing Express + Vite + SQLite monolith as a single Web Service.
-# No secrets live here: Groq/Paystack keys and the app's public origin are set
-# once in the Render dashboard (marked `sync: false` below); JWT_SECRET is
-# generated once by Render on first deploy and kept stable afterwards.
+# Deploys the Express + Vite + PostgreSQL monolith as a single Web Service.
+# No secrets live here: Groq/Paystack keys, DATABASE_URL and the app's public
+# origin are set once in the Render dashboard (marked `sync: false` below);
+# JWT_SECRET is generated once by Render on first deploy and kept stable
+# afterwards.
 #
 # Deploy flow:
 #   git push   ->  Render clones the repo, runs `npm install` (uses the
@@ -11,8 +12,8 @@
 #                  starts the service with startCommand.
 #   build      ->  `tsc && vite build` (typecheck + frontend bundle) followed by
 #                  a secret-leak scan of dist/ that fails the build on any hit.
-#   start      ->  `NODE_ENV=production node server.js`; the SQLite database
-#                  lives on the persistent disk mounted at /data.
+#   start      ->  `NODE_ENV=production node server.js`; the PostgreSQL database
+#                  is managed by a linked Render PostgreSQL instance.
 #
 # IMPORTANT: do NOT set PORT here. Render injects the port the service must
 # listen on; server.js reads `PORT` automatically.
@@ -25,15 +26,11 @@ services:
     buildCommand: npm run build:prod
     startCommand: npm run start:prod
     healthCheckPath: /v1/health
-    disk:
-      name: touchpoint-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATA_DIR
-        value: /data
+      - key: DATABASE_URL
+        sync: false
       - key: TRUST_PROXY
         value: "1"
       - key: JWT_SECRET
@@ -45,6 +42,10 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
         sync: false
       - key: VITE_PAYSTACK_PUBLIC_KEY
         sync: false

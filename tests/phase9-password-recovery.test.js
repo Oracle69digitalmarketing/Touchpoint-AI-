@@ -1,19 +1,16 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setupTestDb, cleanupTestDb } from './helpers/test-db.js';
 
-// Setup similar to phase2-auth.test.js
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-reset-test-'));
-process.env.DATA_DIR = DATA_DIR;
 process.env.JWT_SECRET = 'test-secret';
 process.env.RESEND_API_KEY = 're_test_dummy';
 process.env.GROQ_API_KEY = 'gsk_dummy_for_test';
 process.env.NODE_ENV = 'test';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const testPool = await setupTestDb();
 const { default: app, _setGroqClient } = await import(path.join(__dirname, '..', 'server.js'));
 
 // Mock Groq client
@@ -29,9 +26,9 @@ const server = app.listen(0);
 await new Promise((resolve) => server.once('listening', resolve));
 const base = `http://localhost:${server.address().port}`;
 
-after(() => {
+after(async () => {
   server.close();
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  await cleanupTestDb(testPool);
 });
 
 const request = async (url, { method = 'GET', body } = {}) => {
