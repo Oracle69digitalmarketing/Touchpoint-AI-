@@ -517,10 +517,61 @@ app.get('/v1/auth/me', requireAuth, asyncHandler(async (req, res) => {
   });
 }));
 
-app.post('/v1/auth/logout', requireAuth, asyncHandler(async (req, res) => {
-  await revokeSession(req.sessionId);
-  res.json({ success: true });
+
+/**
+ * PASSWORD RESET ENDPOINTS (/v1/auth)
+ */
+
+app.post('/v1/auth/forgot-password', asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  if (!email || !EMAIL_RE.test(email.trim())) {
+    return res.status(200).json({ message: 'If an account exists, a reset email has been sent.' });
+  }
+  const normalizedEmail = email.trim().toLowerCase();
+  const user = await findUserByEmail(normalizedEmail);
+
+  if (user) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await invalidateUserTokens(user.id);
+    await createResetToken({ userId: user.id, tokenHash, expiresAt });
+
+    const resetUrl = `${APP_URL}/reset-password?token=${rawToken}`;
+    await resend.emails.send({
+      from: config.emailFrom,
+      to: user.email,
+      subject: 'Reset your TouchPoint AI password',
+      html: `<p>You requested a password reset. Click the link below to set a new password:</p>
+             <p><a href="${resetUrl}">Reset Password</a></p>
+             <p>This link expires in 1 hour.</p>`,
+    });
+  }
+
+  res.status(200).json({ message: 'If an account exists, a reset email has been sent.' });
 }));
+
+app.post('/v1/auth/reset-password', asyncHandler(async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password || password.length < 8) {
+    return res.status(400).json({ error: 'Invalid token or password' });
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const resetToken = await findResetToken(tokenHash);
+
+  if (!resetToken) {
+    return res.status(400).json({ error: 'Invalid or expired token' });
+  }
+
+  const passwordHash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
+  await updateUserPassword(resetToken.user_id, passwordHash);
+  await consumeResetToken(resetToken.id);
+
+  res.json({ message: 'Password updated successfully' });
+}));
+
 
 /**
  * BILLING (Phase 7) — server-authoritative Paystack subscriptions

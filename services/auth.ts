@@ -73,4 +73,24 @@ export const authService = {
       clearToken();
     }
   },
+
+  async forgotPassword(email: string): Promise<{ message: string }> {
+    const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    return handleResponse<{ message: string }>(res);
+  },
+
+
+  async resetPassword(token: string, password: string): Promise<{ message: string }> {
+    const res = await fetch(`${API_BASE}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, password }),
+    });
+    return handleResponse<{ message: string }>(res);
+  },
+
 };
