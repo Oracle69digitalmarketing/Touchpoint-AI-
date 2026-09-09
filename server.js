@@ -935,6 +935,10 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
 // error detail is always logged server-side instead.
 const AI_FALLBACK_REPLY = "Thanks for reaching out! I'm having a quick connectivity issue — I'll be right with you.";
 
+/**
+ * AI ENDPOINTS
+ */
+
 app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
   console.log("AI CHAT REQUEST RECEIVED:", {
     agent: req.body?.agent?.name,
@@ -943,28 +947,6 @@ app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
     targetLanguage: req.body?.targetLanguage,
   });
 
-  const { agent, history, userInput, targetLanguage } = req.body;
-
-  try {
-    const text = await runAgentChat({
-      agent,
-      history: history || [],
-      userInput,
-      targetLanguage,
-    });
-
-    res.json({ text });
-  } catch (error) {
-    // Log the full detail server-side; the client only ever sees the safe,
-    // graceful fallback message.
-    console.error("Groq Error:", error);
-    res.status(500).json({ error: AI_FALLBACK_REPLY });
-  }
-}));/**
- * AI ENDPOINTS
- */
-
-app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
   const { agent, history, userInput, targetLanguage } = req.body;
 
   try {
@@ -994,8 +976,7 @@ app.post('/v1/ai/proposal', asyncHandler(async (req, res) => {
         { role: 'user', content: `Context: ${context}. Language: ${targetLanguage}. Generate a proposal from ${agentName}.` }
       ],
       model: 'openai/gpt-oss-120b',
-    
-  response_format: { type: "json_object" }
+      response_format: { type: "json_object" }
     });
     res.json(JSON.parse(completion.choices[0]?.message?.content || '{}'));
   } catch (error) {
