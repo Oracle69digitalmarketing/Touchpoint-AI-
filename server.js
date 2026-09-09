@@ -926,6 +926,13 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
     max_tokens: 150,
   });
 
+  console.log('[AI DEBUG]', JSON.stringify({
+    choices: completion.choices?.length,
+    finish_reason: completion.choices?.[0]?.finish_reason,
+    message: completion.choices?.[0]?.message,
+    usage: completion.usage
+  }));
+
   return completion.choices[0]?.message?.content;
 }
 
