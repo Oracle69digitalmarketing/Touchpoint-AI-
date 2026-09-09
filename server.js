@@ -923,7 +923,9 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
     messages,
     model: 'openai/gpt-oss-120b',
     temperature: 0.7,
-    max_tokens: 150,
+    max_tokens: 400,
+  }, {
+    timeout: 30000,
   });
 
   console.log('[AI DEBUG]', JSON.stringify({
