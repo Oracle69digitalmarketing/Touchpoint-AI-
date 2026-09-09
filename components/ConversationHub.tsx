@@ -35,7 +35,8 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
     if (!currentAgent) return;
 
     const userMsg = { role: 'user' as const, text: input };
-    setChatLog(prev => [...prev, userMsg]);
+    const nextChatLog = [...chatLog, userMsg];
+    setChatLog(nextChatLog);
     setInput('');
     setLoading(true);
 
@@ -51,7 +52,7 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
           catalog: currentAgent.serviceCatalog,
           documents: currentAgent.documents
         },
-        chatLog,
+        nextChatLog,
         inputWithCurrency,
         currentLanguage
       );

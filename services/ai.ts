@@ -21,8 +21,17 @@ export const simulateAgentConversation = async (
       body: JSON.stringify({ agent, history, userInput, targetLanguage })
     });
 
-    if (!response.ok) throw new Error("AI Backend error");
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const message = data.error || data.message || `AI backend request failed (${response.status})`;
+      throw new Error(message);
+    }
+
+    if (!data.text) {
+      throw new Error("AI backend returned an empty response");
+    }
+
     return data.text;
   } catch (error) {
     console.error("AI Proxy Error:", error);
