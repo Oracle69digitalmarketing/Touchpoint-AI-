@@ -35,7 +35,7 @@ export const simulateAgentConversation = async (
     return data.text;
   } catch (error) {
     console.error("AI Proxy Error:", error);
-    return "I'm having a slight connectivity issue with my knowledge base. Please try again in a moment.";
+    throw error;
   }
 };
 
