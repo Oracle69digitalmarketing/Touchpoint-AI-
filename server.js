@@ -923,7 +923,7 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
     messages,
     model: 'openai/gpt-oss-120b',
     temperature: 0.7,
-    max_tokens: 400,
+    max_tokens: 800,
   }, {
     timeout: 30000,
   });
