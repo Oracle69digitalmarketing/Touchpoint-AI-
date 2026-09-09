@@ -2,7 +2,7 @@
  * PHASE 8 — PRODUCTION RUNTIME FIX REGRESSION TESTS
  *
  * Covers the three confirmed production runtime fixes:
- *   - every Groq call uses the active `llama-3.3-70b-versatile` model; the
+ *   - every Groq call uses the active `openai/gpt-oss-120b` model; the
  *     deprecated `llama3-70b-8192` is fully removed from server source.
  *   - TRUST_PROXY resolves to a safe hop count (never permissive `true`) so
  *     Render's X-Forwarded-For header cannot trigger
@@ -153,5 +153,5 @@ test('/v1/ai/chat returns the safe fallback message instead of internal details 
 test('server source uses the active Groq model and no deprecated reference remains', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   assert.ok(!source.includes('llama3-70b-8192'), 'deprecated model is fully removed from server source');
-  assert.ok(source.includes('llama-3.3-70b-versatile'), 'active model is present in server source');
+  assert.ok(source.includes('openai/gpt-oss-120b'), 'active model is present in server source');
 });

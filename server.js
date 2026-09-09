@@ -921,7 +921,7 @@ async function runAgentChat({ agent, history, userInput, targetLanguage }) {
 
   const completion = await groqClient.chat.completions.create({
     messages,
-    model: 'llama-3.3-70b-versatile',
+    model: 'openai/gpt-oss-120b',
     temperature: 0.7,
     max_tokens: 150,
   });
@@ -968,7 +968,7 @@ app.post('/v1/ai/proposal', asyncHandler(async (req, res) => {
         { role: 'system', content: `You are a professional proposal generator. Output ONLY valid JSON.` },
         { role: 'user', content: `Context: ${context}. Language: ${targetLanguage}. Generate a proposal from ${agentName}.` }
       ],
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       response_format: { type: "json_object" }
     });
     res.json(JSON.parse(completion.choices[0]?.message?.content || '{}'));
@@ -1091,7 +1091,7 @@ async function runLeadExtraction({ history }) {
       { role: 'system', content: LEAD_EXTRACTION_PROMPT },
       { role: 'user', content: `Conversation transcript:\n${transcript}\n\nExtract the lead as JSON.` },
     ],
-    model: 'llama-3.3-70b-versatile',
+    model: 'openai/gpt-oss-120b',
     temperature: 0,
     response_format: { type: 'json_object' },
   });
