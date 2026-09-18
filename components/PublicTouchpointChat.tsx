@@ -1,6 +1,6 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Send, Loader2, ShieldCheck, MapPin, User, Globe, MessageSquare, XCircle } from 'lucide-react';
+import { Bot, Send, Loader2, ShieldCheck, MapPin, User, Globe, MessageSquare, XCircle, Mail, Phone, Calendar } from 'lucide-react';
 import { SUPPORTED_LANGUAGES } from '../types';
 
 /**
@@ -25,6 +25,20 @@ interface ChatMessage {
   text: string;
   createdAt?: string;
 }
+
+interface HandoffDestinations {
+  whatsapp?: string;
+  phone?: string;
+  email?: string;
+  bookingUrl?: string;
+}
+
+const handoffHref = (type: keyof HandoffDestinations, value: string): string => {
+  if (/^https?:\/\//i.test(value)) return value;
+  if (type === 'email') return `mailto:${value}`;
+  if (type === 'whatsapp') return `https://wa.me/${value.replace(/[^0-9]/g, '')}`;
+  return `tel:${value.replace(/[^0-9+]/g, '')}`;
+};
 
 const readEmbeddedData = (): PublicTouchpointInfo | null => {
   const node = document.getElementById('touchpoint-data');
@@ -60,6 +74,7 @@ const PublicTouchpointChat: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [handoff, setHandoff] = useState<HandoffDestinations | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const info = initial.current;
@@ -121,6 +136,7 @@ const PublicTouchpointChat: React.FC = () => {
     setInput('');
     setSending(true);
     setError(null);
+    setHandoff(null);
 
     if (customerName.trim()) {
       localStorage.setItem(`touchpoint.name.${trackingId}`, customerName.trim());
@@ -147,6 +163,7 @@ const PublicTouchpointChat: React.FC = () => {
       persistKey(data.conversationId);
       setConversationId(data.conversationId);
       setMessages((data.messages || []).map((m: ChatMessage) => m));
+      setHandoff(data.handoff && Object.keys(data.handoff).length > 0 ? data.handoff : null);
     } catch (err) {
       console.error('[Touchpoint Chat] Send failed:', err);
       setError('Could not reach the agent. Please try again.');
@@ -281,6 +298,34 @@ const PublicTouchpointChat: React.FC = () => {
           {error && (
             <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-xs font-bold">
               {error}
+            </div>
+          )}
+
+          {handoff && (
+            <div className="p-4 bg-white border border-indigo-100 rounded-2xl shadow-sm space-y-2 animate-in slide-in-from-bottom-2 duration-300">
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Continue with {info.business.name}</p>
+              <div className="flex flex-wrap gap-2">
+                {handoff.whatsapp && (
+                  <a href={handoffHref('whatsapp', handoff.whatsapp)} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700 transition-all active:scale-95">
+                    <MessageSquare size={14} /> WhatsApp
+                  </a>
+                )}
+                {handoff.phone && (
+                  <a href={handoffHref('phone', handoff.phone)} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 text-white text-xs font-bold hover:bg-indigo-700 transition-all active:scale-95">
+                    <Phone size={14} /> Call
+                  </a>
+                )}
+                {handoff.email && (
+                  <a href={handoffHref('email', handoff.email)} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-700 text-white text-xs font-bold hover:bg-slate-800 transition-all active:scale-95">
+                    <Mail size={14} /> Email
+                  </a>
+                )}
+                {handoff.bookingUrl && (
+                  <a href={handoffHref('bookingUrl', handoff.bookingUrl)} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-500 text-white text-xs font-bold hover:bg-amber-600 transition-all active:scale-95">
+                    <Calendar size={14} /> Book
+                  </a>
+                )}
+              </div>
             </div>
           )}
         </div>

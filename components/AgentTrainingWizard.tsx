@@ -65,7 +65,7 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
     const files = e.target.files;
     if (files && files.length > 0) {
       setIsUploading(true);
-      // Simulate intelligence extraction
+      // Store reference file names as metadata only; no content extraction yet.
       setTimeout(() => {
         // Fix for TypeScript error: Property 'name' does not exist on type 'unknown'
         // Added explicit type annotation to ensure the 'name' property is accessible on File objects.
@@ -151,17 +151,17 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
              {/* Document Uploads Section */}
              <div className="space-y-3">
                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                 Intelligence Sources {formData.documents.length > 0 && `(${formData.documents.length})`}
+                 Reference Files {formData.documents.length > 0 && `(${formData.documents.length})`}
                </h4>
                {isUploading && (
                  <div className="flex items-center gap-3 p-3 bg-indigo-50 border border-indigo-100 rounded-xl animate-pulse">
                    <Loader2 size={16} className="text-indigo-600 animate-spin" />
-                   <span className="text-xs font-bold text-indigo-700 uppercase tracking-wider">Extracting Intelligence...</span>
+                   <span className="text-xs font-bold text-indigo-700 uppercase tracking-wider">Adding reference file...</span>
                  </div>
                )}
                <div className="grid grid-cols-1 gap-2">
                  {formData.documents.length === 0 && !isUploading && (
-                   <p className="text-xs text-slate-400 italic">Optional: Upload PDFs or Word docs to give the agent deeper knowledge.</p>
+                   <p className="text-xs text-slate-400 italic">Optional: Attach PDFs or Word docs as reference files for the business. File contents are stored for human consultation only.</p>
                  )}
                  {formData.documents.map(doc => (
                    <div key={doc} className="flex items-center justify-between p-3 bg-white border border-slate-100 rounded-xl shadow-sm">
@@ -179,7 +179,7 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
 
              <div className="flex items-center gap-2 p-4 bg-blue-50 text-blue-700 rounded-2xl text-xs">
                 <Sparkles size={16} className="flex-shrink-0" />
-                <span>Tip: Agents with custom documents show 40% higher lead qualification accuracy.</span>
+                <span>Tip: Fill in the Service Catalog, Client Profiles, Success Stories and Guidelines below — the sales agent answers from this knowledge.</span>
              </div>
           </div>
         );
@@ -242,12 +242,12 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
                   <li className="flex justify-between border-b border-slate-200/50 pb-2"><span>Agent Name:</span> <span className="font-bold text-slate-900">{formData.name || 'Unnamed Agent'}</span></li>
                   <li className="flex justify-between border-b border-slate-200/50 pb-2"><span>Market Sector:</span> <span className="font-bold text-slate-900">{formData.industry}</span></li>
                   <li className="flex justify-between border-b border-slate-200/50 pb-2"><span>Voice Profile:</span> <span className="font-bold text-slate-900 capitalize">{formData.voice}</span></li>
-                  <li className="flex justify-between"><span>Intelligence Docs:</span> <span className="font-bold text-indigo-600">{formData.documents.length} Files</span></li>
+                  <li className="flex justify-between"><span>Reference Files:</span> <span className="font-bold text-indigo-600">{formData.documents.length} Files</span></li>
                </ul>
             </div>
             <div className="p-5 bg-emerald-50 text-emerald-700 rounded-3xl border border-emerald-100 text-sm flex gap-3">
                <Zap className="flex-shrink-0" size={20} />
-               <p className="leading-relaxed font-medium">Ready to deploy. Your agent will leverage the <strong>Gemini 3 Pro</strong> reasoning engine to represent your business 24/7.</p>
+               <p className="leading-relaxed font-medium">Ready to deploy. Your agent will represent your business 24/7 using the TouchPoint AI conversation engine.</p>
             </div>
           </div>
         );
@@ -261,7 +261,7 @@ const AgentTrainingWizard: React.FC<WizardProps> = ({ onComplete, onCancel, agen
         <div className="p-10 border-b border-slate-100 flex items-center justify-between">
           <div>
             <h2 className="text-3xl font-bold text-slate-900 tracking-tight">{isEditing ? 'Edit Agent' : 'Agent Training'}</h2>
-            <p className="text-slate-500 font-medium mt-1">{isEditing ? 'Refine the intelligence layer for your workforce' : 'Provisioning intelligence layer for your workforce'}</p>
+            <p className="text-slate-500 font-medium mt-1">{isEditing ? 'Refine the sales knowledge for your workforce' : 'Configure the sales knowledge for your workforce'}</p>
           </div>
           <button onClick={onCancel} className="p-3 hover:bg-slate-50 rounded-2xl text-slate-400 hover:text-slate-900 transition-all"><X size={24} /></button>
         </div>

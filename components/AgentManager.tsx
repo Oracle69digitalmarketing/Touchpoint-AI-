@@ -20,7 +20,7 @@ const AgentManager: React.FC<Props> = ({ agents, onOpenWizard, onEditAgent, onDe
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-slate-900 tracking-tight text-gradient">AI Sales Workforce</h1>
-          <p className="text-slate-500 font-medium">Your specialized agents trained on your unique business intelligence.</p>
+          <p className="text-slate-500 font-medium">Your specialized agents configured with your business knowledge.</p>
         </div>
         <button 
           onClick={onOpenWizard}

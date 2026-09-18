@@ -9,16 +9,41 @@ const API_BASE = '/v1';
 import { getAuthHeaders } from './auth';
 
 export const simulateAgentConversation = async (
-  agent: { name: string; industry: string; voice: string; catalog?: string; documents?: string[] },
+  agent: {
+    id?: string;
+    name: string;
+    industry: string;
+    voice: string;
+    description?: string;
+    catalog?: string;
+    serviceCatalog?: string;
+    service_catalog?: string;
+    clientProfiles?: string;
+    client_profiles?: string;
+    caseLibrary?: string;
+    case_library?: string;
+    guidelines?: string;
+    documents?: string[];
+  },
   history: { role: 'user' | 'model', text: string }[],
   userInput: string,
-  targetLanguage: string = 'en'
+  targetLanguage: string = 'en',
+  currencyCode?: string,
+  conversationId?: string
 ) => {
   try {
     const response = await fetch(`${API_BASE}/ai/chat`, {
       method: 'POST',
       headers: getAuthHeaders(true),
-      body: JSON.stringify({ agent, history, userInput, targetLanguage })
+      body: JSON.stringify({
+        agent,
+        agentId: agent?.id,
+        conversationId,
+        history,
+        userInput,
+        targetLanguage,
+        currencyCode
+      })
     });
 
     const data = await response.json().catch(() => ({}));

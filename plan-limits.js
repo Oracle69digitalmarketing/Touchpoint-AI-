@@ -12,6 +12,7 @@ export const PLAN_LIMITS = {
     agents: 1,
     touchpoints: 5,
     leads: 15,
+    products: 5,
     features: ['Basic Dashboard', 'Touchpoint Branding']
   },
   Starter: {
@@ -19,6 +20,7 @@ export const PLAN_LIMITS = {
     agents: 1,
     touchpoints: 50,
     leads: 100,
+    products: 50,
     features: ['CRM Sync', 'Lead Export (CSV)', 'WhatsApp/Email Alerts', 'No Branding']
   },
   Growth: {
@@ -26,6 +28,7 @@ export const PLAN_LIMITS = {
     agents: 5,
     touchpoints: 500,
     leads: 1000,
+    products: 200,
     features: ['Multi-user Access', 'Automation Engine', 'Advanced Analytics', 'Routing Rules']
   },
   Business: {
@@ -33,6 +36,7 @@ export const PLAN_LIMITS = {
     agents: 20,
     touchpoints: 1000,
     leads: 5000,
+    products: 500,
     features: ['Role-based Permissions', 'Priority Support', 'Full Pipeline Mapping']
   },
   Enterprise: {
@@ -40,6 +44,7 @@ export const PLAN_LIMITS = {
     agents: 100,
     touchpoints: 5000,
     leads: 100000,
+    products: 1000,
     features: ['White-label', 'NFC Hardware Orchestration', 'Dedicated Support']
   }
 };

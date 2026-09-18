@@ -118,7 +118,7 @@ const SurfaceGenerator: React.FC<Props> = ({ agents, onDeploy, onNavigate }) => 
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">3. Assign Intelligence</label>
+              <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">3. Assign Agent</label>
               <select 
                 className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
                 value={selectedAgentId}

@@ -53,7 +53,7 @@ export async function createBusiness(name, slug) {
 
 export async function getBusinessById(id) {
   const res = await pool.query(
-    'SELECT id, name, slug, plan, created_at FROM businesses WHERE id = $1',
+    'SELECT id, name, slug, plan, whatsapp, phone, email, booking_url, created_at FROM businesses WHERE id = $1',
     [id]
   );
   const business = res.rows[0] || null;
@@ -68,6 +68,32 @@ export async function getBusinessById(id) {
 export async function businessSlugExists(slug) {
   const res = await pool.query('SELECT 1 FROM businesses WHERE slug = $1', [slug]);
   return res.rowCount > 0;
+}
+
+/**
+ * Handoff settings are stored on the business row and are server-authoritative:
+ * the agent may only offer channels that were explicitly persisted here.
+ */
+export async function updateBusinessHandoff(businessId, fields) {
+  const allowed = {
+    whatsapp: fields.whatsapp,
+    phone: fields.phone,
+    email: fields.email,
+    booking_url: fields.bookingUrl,
+  };
+
+  const sets = [];
+  const params = [];
+  for (const [col, val] of Object.entries(allowed)) {
+    if (val === undefined) continue;
+    sets.push(`${col} = $${params.length + 1}`);
+    params.push(val);
+  }
+  if (sets.length === 0) return getBusinessById(businessId);
+
+  params.push(businessId);
+  await pool.query(`UPDATE businesses SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${params.length}`, params);
+  return getBusinessById(businessId);
 }
 
 export async function createUser({ id, businessId, email, passwordHash, name, role = 'owner', emailVerified = false, verificationToken = null, verificationExpiresAt = null }) {
@@ -546,9 +572,29 @@ export async function recordScan({ touchpointId, businessId, userAgent }) {
 
 const CONVERSATION_COLUMNS = `
   c.id, c.business_id, c.touchpoint_id, c.agent_id, c.customer_name,
-  c.target_language, c.created_at, c.updated_at,
+  c.target_language, c.stage, c.intent, c.customer_need,
+  c.recommended_product_id, c.buying_signal, c.objection, c.contact_declined,
+  c.questions_asked, c.captured_lead_fields, c.next_best_action,
+  c.created_at, c.updated_at,
   tp.name AS touchpoint_name, a.name AS agent_name
 `;
+
+function decodeSalesState(conversation) {
+  return {
+    stage: conversation.stage || 'engage',
+    intent: conversation.intent || null,
+    customerNeed: conversation.customer_need || null,
+    recommendedProductId: conversation.recommended_product_id || null,
+    buyingSignal: !!conversation.buying_signal,
+    objection: conversation.objection || null,
+    contactDeclined: !!conversation.contact_declined,
+    questionsAsked: Array.isArray(conversation.questions_asked) ? conversation.questions_asked : [],
+    capturedLeadFields: conversation.captured_lead_fields && typeof conversation.captured_lead_fields === 'object'
+      ? conversation.captured_lead_fields
+      : {},
+    nextBestAction: conversation.next_best_action || null,
+  };
+}
 
 export async function createConversation({ touchpoint, agentId, customerName, targetLanguage }) {
   const id = crypto.randomUUID();
@@ -566,7 +612,9 @@ export async function getConversationById(id) {
     JOIN agents a ON a.id = c.agent_id
     WHERE c.id = $1
   `, [id]);
-  return res.rows[0] || null;
+  const conversation = res.rows[0] || null;
+  if (!conversation) return null;
+  return { ...conversation, salesState: decodeSalesState(conversation) };
 }
 
 export async function addConversationMessage({ conversationId, role, text }) {
@@ -616,7 +664,144 @@ export async function listConversations(businessId) {
     WHERE c.business_id = $1
     ORDER BY c.updated_at DESC
   `, [businessId]);
-  return res.rows;
+  return res.rows.map((conversation) => ({ ...conversation, salesState: decodeSalesState(conversation) }));
+}
+
+/**
+ * STRUCTURED PRODUCT/SERVICE CATALOG (Batch 2)
+ *
+ * Authoritative when any rows exist for a business. The legacy free-text
+ * agents.service_catalog remains the compatibility fallback until structured
+ * products are configured.
+ */
+
+const PRODUCT_COLUMNS = `
+  id, business_id, name, description, category, price, currency, status,
+  metadata, created_at, updated_at
+`;
+
+const parsePrice = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+
+export async function createProduct(businessId, data) {
+  const id = crypto.randomUUID();
+  await pool.query(`
+    INSERT INTO products (
+      id, business_id, name, description, category, price, currency, status, metadata
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+  `, [
+    id, businessId, data.name, data.description || null, data.category || null,
+    data.price, data.currency || 'NGN', data.status || 'active',
+    data.metadata && typeof data.metadata === 'object'
+      ? JSON.stringify(data.metadata)
+      : '{}',
+  ]);
+  return getProductById(businessId, id);
+}
+
+export async function getProductById(businessId, id) {
+  const res = await pool.query(
+    `SELECT ${PRODUCT_COLUMNS} FROM products WHERE id = $1 AND business_id = $2`,
+    [id, businessId]
+  );
+  const product = res.rows[0] || null;
+  if (!product) return null;
+  product.price = parsePrice(product.price);
+  return product;
+}
+
+export async function listProducts(businessId, { status = null } = {}) {
+  let sql = `SELECT ${PRODUCT_COLUMNS} FROM products WHERE business_id = $1`;
+  const params = [businessId];
+  if (status) {
+    params.push(status);
+    sql += ` AND status = $${params.length}`;
+  }
+  sql += ' ORDER BY created_at ASC';
+  const res = await pool.query(sql, params);
+  return res.rows.map((product) => ({ ...product, price: parsePrice(product.price) }));
+}
+
+export async function countProducts(businessId) {
+  const res = await pool.query('SELECT COUNT(*) AS n FROM products WHERE business_id = $1', [businessId]);
+  return parseInt(res.rows[0].n, 10);
+}
+
+export async function updateProduct(businessId, id, data) {
+  const allowed = {
+    name: data.name,
+    description: data.description,
+    category: data.category,
+    price: data.price,
+    currency: data.currency,
+    status: data.status,
+    metadata: data.metadata && typeof data.metadata === 'object'
+      ? JSON.stringify(data.metadata)
+      : undefined,
+  };
+
+  const sets = [];
+  const params = [];
+  for (const [col, val] of Object.entries(allowed)) {
+    if (val === undefined) continue;
+    sets.push(`${col} = $${params.length + 1}`);
+    params.push(val);
+  }
+  if (sets.length === 0) return getProductById(businessId, id);
+
+  params.push(businessId, id);
+  const res = await pool.query(`
+    UPDATE products SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP
+    WHERE business_id = $${params.length - 1} AND id = $${params.length}
+  `, params);
+
+  if (res.rowCount === 0) return null;
+  return getProductById(businessId, id);
+}
+
+export async function deleteProduct(businessId, id) {
+  const res = await pool.query('DELETE FROM products WHERE business_id = $1 AND id = $2', [businessId, id]);
+  return res.rowCount > 0;
+}
+
+/**
+ * PERSISTENT SALES CONVERSATION STATE (Batch 2)
+ *
+ * The server owns stage/intent/next-best-action derivation and stores the
+ * result here so resumed conversations never depend on the LLM remembering
+ * them from the transcript.
+ */
+export async function updateConversationSalesState(conversationId, state) {
+  await pool.query(`
+    UPDATE conversations SET
+      stage = $1,
+      intent = $2,
+      customer_need = $3,
+      recommended_product_id = $4,
+      buying_signal = $5,
+      objection = $6,
+      contact_declined = $7,
+      questions_asked = $8,
+      captured_lead_fields = $9,
+      next_best_action = $10,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $11
+  `, [
+    state.stage || 'engage',
+    state.intent || null,
+    state.customerNeed || null,
+    state.recommendedProductId || null,
+    !!state.buyingSignal,
+    state.objection || null,
+    state.contactDeclined === true,
+    JSON.stringify(Array.isArray(state.questionsAsked) ? state.questionsAsked : []),
+    JSON.stringify(state.capturedLeadFields && typeof state.capturedLeadFields === 'object' ? state.capturedLeadFields : {}),
+    state.nextBestAction || null,
+    conversationId,
+  ]);
+  return getConversationById(conversationId);
 }
 
 /**
@@ -785,6 +970,68 @@ export async function markLeadNotificationsRead(businessId) {
     [businessId]
   );
   return res.rowCount;
+}
+
+/**
+ * FUNNEL EVENT STORAGE (Batch 3)
+ *
+ * Append-only, business-scoped record of observable sales-funnel moments (a
+ * contact field captured, a qualification change, a recommendation, an
+ * objection, a buying signal, an offered handoff, a started handoff, a
+ * quote/booking/demo request). An event is only ever written when the
+ * application actually observed the transition — never fabricated from the
+ * customer's wishes.
+ */
+export async function createFunnelEvent({ businessId, conversationId = null, eventType, meta = null }) {
+  const id = crypto.randomUUID();
+  await pool.query(`
+    INSERT INTO funnel_events (id, business_id, conversation_id, event_type, meta)
+    VALUES ($1, $2, $3, $4, $5)
+  `, [
+    id,
+    businessId,
+    conversationId,
+    eventType,
+    meta && typeof meta === 'object' ? JSON.stringify(meta) : '{}',
+  ]);
+  return id;
+}
+
+export async function countFunnelEventsByType(businessId, { start = null, end = null } = {}) {
+  const { clause, params } = analyticsRangeClause(start, end, 2);
+  const res = await pool.query(
+    `SELECT event_type AS type, COUNT(*) AS n
+     FROM funnel_events
+     WHERE business_id = $1${clause}
+     GROUP BY event_type
+     ORDER BY n DESC`,
+    [businessId, ...params]
+  );
+  return res.rows.map((row) => ({ type: row.type, count: parseInt(row.n, 10) }));
+}
+
+/**
+ * Conversation-scoped deduplication probe: has this exact observable event
+ * (optionally distinguished by a meta key) already been recorded for this
+ * conversation? Used only to avoid repeating an identical offer/start event
+ * when the assistant restates the same channel — not a general event store.
+ */
+export async function hasFunnelEvent({ businessId, conversationId = null, eventType, metaKey = null }) {
+  const params = [businessId, eventType];
+  let sql = 'SELECT 1 FROM funnel_events WHERE business_id = $1 AND event_type = $2';
+  if (conversationId) {
+    params.push(conversationId);
+    sql += ` AND conversation_id = $${params.length}`;
+  } else {
+    sql += ' AND conversation_id IS NULL';
+  }
+  if (metaKey !== null && metaKey !== undefined) {
+    params.push(metaKey);
+    sql += ` AND meta->>'key' = $${params.length}`;
+  }
+  sql += ' LIMIT 1';
+  const res = await pool.query(sql, params);
+  return res.rows.length > 0;
 }
 
 /**

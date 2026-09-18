@@ -22,6 +22,10 @@ interface RawConversation {
   messageCount: number;
   createdAt: string;
   updatedAt: string;
+  stage?: string;
+  intent?: string;
+  nextBestAction?: string;
+  contactDeclined?: boolean;
 }
 
 const toConversation = (raw: RawConversation): Conversation => ({
@@ -29,9 +33,12 @@ const toConversation = (raw: RawConversation): Conversation => ({
   agentId: raw.agentId,
   customerName: raw.customerName || 'Anonymous visitor',
   lastMessage: raw.lastMessage || '',
-  stage: ConversationStage.ENGAGE,
+  stage: (raw.stage as ConversationStage) || ConversationStage.ENGAGE,
   isQualified: false,
   timestamp: raw.createdAt,
+  intent: raw.intent,
+  nextBestAction: raw.nextBestAction,
+  contactDeclined: !!raw.contactDeclined,
 });
 
 export const conversationService = {

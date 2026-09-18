@@ -37,9 +37,11 @@ export enum SurfaceType {
 export enum ConversationStage {
   ENGAGE = 'engage',
   DISCOVER = 'discover',
-  DIAGNOSE = 'diagnose',
-  VALUE_MAP = 'value',
-  OFFER = 'offer',
+  UNDERSTAND = 'understand',
+  RECOMMEND = 'recommend',
+  OBJECTION = 'objection',
+  QUALIFY = 'qualify',
+  ADVANCE = 'advance',
   CONVERT = 'convert'
 }
 
@@ -83,6 +85,9 @@ export interface Conversation {
   stage: ConversationStage;
   isQualified: boolean;
   timestamp: string;
+  intent?: string;
+  nextBestAction?: string;
+  contactDeclined?: boolean;
 }
 
 export type LeadQualificationStatus = 'qualified' | 'unqualified' | 'pending';
@@ -154,6 +159,7 @@ export type PlanLimits = {
   agents: number;
   touchpoints: number;
   leads: number;
+  products: number;
   features: string[];
 };
 

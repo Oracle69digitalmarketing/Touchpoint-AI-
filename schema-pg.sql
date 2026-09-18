@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS businesses (
   name       TEXT NOT NULL,
   slug       TEXT NOT NULL UNIQUE,
   plan       TEXT NOT NULL DEFAULT 'Free',
+  whatsapp   TEXT,
+  phone      TEXT,
+  email      TEXT,
+  booking_url TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -90,9 +94,45 @@ CREATE TABLE IF NOT EXISTS conversations (
   agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   customer_name   TEXT,
   target_language TEXT NOT NULL DEFAULT 'en',
+  stage           TEXT NOT NULL DEFAULT 'engage',
+  intent          TEXT,
+  customer_need   TEXT,
+  recommended_product_id TEXT,
+  buying_signal   BOOLEAN NOT NULL DEFAULT FALSE,
+  objection       TEXT,
+  contact_declined BOOLEAN NOT NULL DEFAULT FALSE,
+  questions_asked JSONB NOT NULL DEFAULT '[]',
+  captured_lead_fields JSONB NOT NULL DEFAULT '{}',
+  next_best_action TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Structured product/service catalog (Batch 2). Authoritative when any rows
+-- exist for a business; the legacy free-text agents.service_catalog remains
+-- the compatibility fallback until structured products are configured.
+CREATE TABLE IF NOT EXISTS products (
+  id          TEXT PRIMARY KEY,
+  business_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  description TEXT,
+  category    TEXT,
+  price       NUMERIC(14, 2) NOT NULL DEFAULT 0,
+  currency    TEXT NOT NULL DEFAULT 'NGN',
+  status      TEXT NOT NULL DEFAULT 'active',
+  metadata    JSONB NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_conversations_recommended_product') THEN
+        ALTER TABLE conversations
+        ADD CONSTRAINT fk_conversations_recommended_product
+        FOREIGN KEY (recommended_product_id) REFERENCES products(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS conversation_messages (
   id              TEXT PRIMARY KEY,
@@ -128,6 +168,20 @@ CREATE TABLE IF NOT EXISTS lead_notifications (
   read_at     TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Observed conversion-funnel events (Batch 3). Append-only and tenant-scoped;
+-- event types are validated in the application before insert.
+CREATE TABLE IF NOT EXISTS funnel_events (
+  id              TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  event_type      TEXT NOT NULL,
+  meta            JSONB NOT NULL DEFAULT '{}',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_funnel_events_business ON funnel_events(business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_funnel_events_type ON funnel_events(business_id, event_type);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   business_id                 TEXT PRIMARY KEY REFERENCES businesses(id) ON DELETE CASCADE,
@@ -196,8 +250,11 @@ CREATE INDEX IF NOT EXISTS idx_touchpoints_agent ON touchpoints(agent_id);
 CREATE INDEX IF NOT EXISTS idx_scans_touchpoint ON touchpoint_scans(touchpoint_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_business ON conversations(business_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_touchpoint ON conversations(touchpoint_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_stage ON conversations(business_id, stage);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON conversation_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_leads_business ON leads(business_id);
+CREATE INDEX IF NOT EXISTS idx_products_business ON products(business_id);
+CREATE INDEX IF NOT EXISTS idx_products_business_status ON products(business_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_conversation ON leads(conversation_id) WHERE conversation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_lead_notifications_business ON lead_notifications(business_id);
 

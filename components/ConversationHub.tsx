@@ -41,20 +41,23 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
     setLoading(true);
 
     try {
-      // We pass the currency symbol to help the model quote correctly
-      const inputWithCurrency = `${input} (Note: Please quote values in ${currObj.code} ${currObj.symbol} if relevant)`;
-      
       const response = await simulateAgentConversation(
-        { 
-          name: currentAgent.name, 
-          industry: currentAgent.industry, 
+        {
+          id: currentAgent.id,
+          name: currentAgent.name,
+          industry: currentAgent.industry,
           voice: currentAgent.voice,
+          description: currentAgent.description,
           catalog: currentAgent.serviceCatalog,
-          documents: currentAgent.documents
+          clientProfiles: currentAgent.clientProfiles,
+          caseLibrary: currentAgent.caseLibrary,
+          guidelines: currentAgent.guidelines,
+          documents: currentAgent.documents,
         },
         nextChatLog,
-        inputWithCurrency,
-        currentLanguage
+        input,
+        currentLanguage,
+        currObj.code
       );
       setChatLog(prev => [...prev, { role: 'model', text: response }]);
     } catch (e) {
@@ -114,7 +117,7 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
                   ? 'bg-indigo-600 text-white rounded-br-none shadow-xl shadow-indigo-100 font-medium' 
                   : 'bg-white border border-slate-100 text-slate-800 rounded-bl-none shadow-sm font-medium'
               }`}>
-                {msg.text.split(' (Note: ')[0]} {/* Hide the currency prompt from UI */}
+                {msg.text}
               </div>
             </div>
           ))}
@@ -228,36 +231,24 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
             <Globe size={120} className="text-indigo-500" />
           </div>
           <div className="relative z-10">
-            <h4 className="font-bold text-lg mb-2">Global Performance</h4>
-            <p className="text-xs text-indigo-200/70 font-medium mb-8">Real-time engagement optimization.</p>
-            <div className="space-y-5">
-               <div className="space-y-2">
-                 <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-indigo-300">
-                    <span>Language Accuracy</span>
-                    <span>99.2%</span>
-                 </div>
-                 <div className="w-full bg-white/5 h-2 rounded-full overflow-hidden">
-                    <div className="w-[99%] h-full bg-indigo-500 rounded-full shadow-[0_0_8px_rgba(99,102,241,0.5)]"></div>
-                 </div>
-               </div>
-               <div className="space-y-2">
-                 <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-emerald-300">
-                    <span>Handoff Success</span>
-                    <span>94%</span>
-                 </div>
-                 <div className="w-full bg-white/5 h-2 rounded-full overflow-hidden">
-                    <div className="w-[94%] h-full bg-emerald-500 rounded-full shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
-                 </div>
-               </div>
-            </div>
+            <h4 className="font-bold text-lg mb-2">Workspace Performance</h4>
+            <p className="text-xs text-indigo-200/70 font-medium mb-8">From your live conversations and leads.</p>
             <div className="mt-8 pt-8 border-t border-white/5 grid grid-cols-2 gap-4">
                <div>
-                 <p className="text-2xl font-black text-indigo-400">12</p>
-                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Langs Supported</p>
+                 <p className="text-2xl font-black text-indigo-400">{conversations.length}</p>
+                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Conversations</p>
                </div>
                <div>
-                 <p className="text-2xl font-black text-emerald-400">1.2s</p>
-                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Transl. Latency</p>
+                 <p className="text-2xl font-black text-emerald-400">{leads.filter(l => l.qualificationStatus === 'qualified').length}</p>
+                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Qualified Leads</p>
+               </div>
+               <div>
+                 <p className="text-2xl font-black text-amber-400">{agents.filter(a => a.status === 'Active').length}</p>
+                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Active Agents</p>
+               </div>
+               <div>
+                 <p className="text-2xl font-black text-white">{SUPPORTED_LANGUAGES.length}</p>
+                 <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Langs Supported</p>
                </div>
             </div>
           </div>
