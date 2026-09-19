@@ -90,10 +90,11 @@ CREATE TABLE IF NOT EXISTS touchpoint_scans (
 CREATE TABLE IF NOT EXISTS conversations (
   id              TEXT PRIMARY KEY,
   business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-  touchpoint_id   TEXT NOT NULL REFERENCES touchpoints(id) ON DELETE CASCADE,
+  touchpoint_id   TEXT REFERENCES touchpoints(id) ON DELETE SET NULL,
   agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   customer_name   TEXT,
   target_language TEXT NOT NULL DEFAULT 'en',
+  channel         TEXT NOT NULL DEFAULT 'web',
   stage           TEXT NOT NULL DEFAULT 'engage',
   intent          TEXT,
   customer_need   TEXT,
@@ -169,12 +170,97 @@ CREATE TABLE IF NOT EXISTS lead_notifications (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Commercial transaction foundation (Phase 13A): deterministic orders, order
+-- lines, validated commercial-action proposals, and channel identity/config.
+-- Payment state can only ever be changed by verified payment-provider events;
+-- the LLM cannot mark an order PAID or fulfilled.
+
+CREATE TABLE IF NOT EXISTS orders (
+  id                 TEXT PRIMARY KEY,
+  business_id        TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  conversation_id    TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  lead_id            TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  channel            TEXT NOT NULL DEFAULT 'web',
+  customer_name      TEXT,
+  status             TEXT NOT NULL DEFAULT 'draft',
+  currency           TEXT NOT NULL DEFAULT 'NGN',
+  subtotal           NUMERIC(14, 2) NOT NULL DEFAULT 0,
+  total              NUMERIC(14, 2) NOT NULL DEFAULT 0,
+  payment_status     TEXT NOT NULL DEFAULT 'unpaid',
+  fulfillment_status TEXT NOT NULL DEFAULT 'unfulfilled',
+  metadata           JSONB NOT NULL DEFAULT '{}',
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+  id          TEXT PRIMARY KEY,
+  order_id    TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id  TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  product_name TEXT NOT NULL,
+  quantity    INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  unit_price  NUMERIC(14, 2) NOT NULL CHECK (unit_price >= 0),
+  total       NUMERIC(14, 2) NOT NULL CHECK (total >= 0),
+  metadata    JSONB NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (order_id, product_id)
+);
+
+-- Validated commercial-action proposals. The AI may propose an action; only the
+-- server may execute one, and only after deterministic validation. Status is a
+-- server-controlled state machine (proposed -> executed | rejected); no request
+-- body can ever set it.
+CREATE TABLE IF NOT EXISTS commercial_actions (
+  id              TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  action_type     TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'proposed',
+  lead_id         TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  product_id      TEXT REFERENCES products(id) ON DELETE SET NULL,
+  order_id        TEXT REFERENCES orders(id) ON DELETE SET NULL,
+  customer        JSONB NOT NULL DEFAULT '{}',
+  metadata        JSONB NOT NULL DEFAULT '{}',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Deterministic channel identity: one (business, channel, external customer id)
+-- maps to one conversation, and therefore to the shared sales engine.
+CREATE TABLE IF NOT EXISTS channel_identities (
+  id              TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  channel         TEXT NOT NULL,
+  external_id     TEXT NOT NULL,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (business_id, channel, external_id)
+);
+
+-- Business-level channel configuration. PUBLIC settings only (enabled, status,
+-- display name). Provider credentials/secrets belong to the deployment
+-- environment, never to source code, seeds, logs, frontend, or this table.
+CREATE TABLE IF NOT EXISTS channel_config (
+  id           TEXT PRIMARY KEY,
+  business_id  TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  channel      TEXT NOT NULL,
+  enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+  status       TEXT NOT NULL DEFAULT 'not_configured',
+  display_name TEXT NOT NULL DEFAULT 'WhatsApp',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (business_id, channel)
+);
+
 -- Observed conversion-funnel events (Batch 3). Append-only and tenant-scoped;
 -- event types are validated in the application before insert.
 CREATE TABLE IF NOT EXISTS funnel_events (
   id              TEXT PRIMARY KEY,
   business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
   conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  order_id        TEXT REFERENCES orders(id) ON DELETE SET NULL,
   event_type      TEXT NOT NULL,
   meta            JSONB NOT NULL DEFAULT '{}',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -261,6 +347,15 @@ CREATE INDEX IF NOT EXISTS idx_lead_notifications_business ON lead_notifications
 CREATE INDEX IF NOT EXISTS idx_scans_business_created ON touchpoint_scans(business_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_business_created ON conversations(business_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_business_created ON leads(business_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_orders_business_created ON orders(business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_orders_conversation ON orders(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_commercial_actions_business ON commercial_actions(business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_commercial_actions_status ON commercial_actions(business_id, status);
+CREATE INDEX IF NOT EXISTS idx_channel_identities_conversation ON channel_identities(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_channel_config_business ON channel_config(business_id);
 
 CREATE INDEX IF NOT EXISTS idx_paystack_tx_business ON paystack_transactions(business_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_subscription_code ON subscriptions(paystack_subscription_code);

@@ -114,8 +114,27 @@ import {
   setPaystackTransactionFinalStatus,
   hasWebhookEvent,
   recordWebhookEvent,
+  createOrderRecord,
+  getOrderById,
+  listOrders,
+  listOrdersByConversation,
+  setOrderStatus,
+  setOrderPaymentStatus,
+  addOrderItemRecord,
+  createCommercialAction,
+  getCommercialAction,
+  listCommercialActions,
+  setCommercialActionStatus,
+  linkCommercialActionOrder,
+  getChannelIdentity,
+  createChannelIdentity,
+  getChannelConfigForBusiness,
+  upsertChannelConfig,
+  listChannelConfigs,
+  findDefaultAgent,
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
+import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendChannelMessage } from './channel-adapter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1854,6 +1873,16 @@ const FUNNEL_EVENT_TYPES = new Set([
   'booking_started',
   'demo_requested',
   'purchase_started',
+  // Phase 13A commercial events. Each is recorded ONLY when the server itself
+  // performed the transition (or a verified provider event did); payment_verified
+  // and order_fulfilled have no Phase 13A emitter by design.
+  'order_created',
+  'order_item_added',
+  'payment_started',
+  'payment_verified',
+  'order_fulfillment_started',
+  'order_fulfilled',
+  'order_cancelled',
 ]);
 
 async function recordFunnelEvent({ businessId, conversationId = null, eventType, meta = null }) {
@@ -2015,15 +2044,19 @@ async function runLeadExtraction({ history }) {
  * never overwritten by a null or invalid proposal, and phone/email captured
  * from the customer's own words are never replaced by LLM guesses.
  */
-async function captureLeadFromConversation({ conversation, touchpoint, agent, salesState }) {
+async function captureLeadFromConversation({ conversation, touchpoint = null, businessId = null, touchpointId = null, agent, salesState }) {
   const history = await listConversationMessages(conversation.id);
   if (history.length === 0) return null;
 
-  const business = await getBusinessById(touchpoint.business_id);
+  const bizId = touchpoint ? touchpoint.business_id : businessId;
+  const tpId = touchpoint ? touchpoint.id : touchpointId;
+  if (!bizId) return null;
+
+  const business = await getBusinessById(bizId);
   const plan = (business && business.plan) || 'Free';
   const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.Free;
 
-  const existing = await findLeadByConversation(touchpoint.business_id, conversation.id);
+  const existing = await findLeadByConversation(bizId, conversation.id);
 
   // Bounded incremental extraction: existing leads only rescan the recent tail.
   const extractionWindow = existing ? history.slice(-8) : history;
@@ -2066,18 +2099,18 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent, sa
     if (merged.qualificationScore !== existing.qualification_score) patch.qualificationScore = merged.qualificationScore;
     if (merged.qualificationStatus !== existing.qualification_status) patch.qualificationStatus = merged.qualificationStatus;
     lead = Object.keys(patch).length
-      ? await updateLead(touchpoint.business_id, existing.id, patch)
+      ? await updateLead(bizId, existing.id, patch)
       : existing;
   } else {
-    if ((await countLeads(touchpoint.business_id)) >= limits.leads) {
+    if ((await countLeads(bizId)) >= limits.leads) {
       console.warn(
-        `[Lead Capture] ${plan} plan lead limit (${limits.leads}) reached for business ${touchpoint.business_id}; skipping persistence`
+        `[Lead Capture] ${plan} plan lead limit (${limits.leads}) reached for business ${bizId}; skipping persistence`
       );
       return null;
     }
     lead = await createLead({
-      businessId: touchpoint.business_id,
-      touchpointId: touchpoint.id,
+      businessId: bizId,
+      touchpointId: tpId,
       conversationId: conversation.id,
       agentId: agent ? agent.id : null,
       name: merged.name,
@@ -2091,7 +2124,7 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent, sa
   }
 
   if (lead && lead.qualification_status === 'qualified' && !lead.notified) {
-    await createLeadNotification({ businessId: touchpoint.business_id, leadId: lead.id });
+    await createLeadNotification({ businessId: bizId, leadId: lead.id });
   }
 
   // Lead-intelligence funnel events, only for transitions actually observed.
@@ -2099,7 +2132,7 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent, sa
     for (const key of ['name', 'phone', 'email']) {
       if (!existing[key] && lead[key]) {
         await recordFunnelEvent({
-          businessId: touchpoint.business_id,
+          businessId: bizId,
           conversationId: conversation.id,
           eventType: 'lead_field_captured',
           meta: { field: key },
@@ -2113,7 +2146,7 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent, sa
       && new Date(existing.updated_at).getTime() > new Date(existing.created_at).getTime();
     if (hadPriorUpdate && existing.qualification_status && existing.qualification_status !== lead.qualification_status) {
       await recordFunnelEvent({
-        businessId: touchpoint.business_id,
+        businessId: bizId,
         conversationId: conversation.id,
         eventType: 'qualification_updated',
         meta: { from: existing.qualification_status, to: lead.qualification_status },
@@ -2123,7 +2156,7 @@ async function captureLeadFromConversation({ conversation, touchpoint, agent, sa
     for (const key of ['name', 'phone', 'email']) {
       if (lead[key]) {
         await recordFunnelEvent({
-          businessId: touchpoint.business_id,
+          businessId: bizId,
           conversationId: conversation.id,
           eventType: 'lead_field_captured',
           meta: { field: key },
@@ -2690,9 +2723,20 @@ app.put('/v1/products/:id', asyncHandler(async (req, res) => {
   res.status(200).json({ product: publicProduct(updated) });
 }));
 
-// Delete a product (scoped to the authenticated business).
-app.delete('/v1/products/:id', asyncHandler(async (req, res) => {
-  if (!await deleteProduct(req.business.id, req.params.id)) {
+// Delete a product (scoped to the authenticated business). A product that is
+// part of an order cannot be deleted: order lines snapshot identity, and an
+// order is a legal record that must keep resolving.
+app.delete('/v1/products/:id', requireAuth, asyncHandler(async (req, res) => {
+  let deleted = false;
+  try {
+    deleted = await deleteProduct(req.business.id, req.params.id);
+  } catch (error) {
+    if (error && error.code === '23503') {
+      return res.status(409).json({ error: 'This product is referenced by one or more orders and cannot be deleted', code: 'PRODUCT_IN_ORDER' });
+    }
+    throw error;
+  }
+  if (!deleted) {
     return res.status(404).json({ error: 'Product not found' });
   }
   res.status(200).json({ success: true });
@@ -2879,6 +2923,154 @@ app.get('/v1/t/:trackingId/handoff', asyncHandler(async (req, res) => {
   res.json({ channels: customerHandoffDestinations(channels) });
 }));
 
+// Shared conversation engine. Every channel that reaches a customer runs this
+// exact pipeline, so a customer on web and a customer on WhatsApp get the same
+// sales brain, the same catalogs and the same deterministic transitions. A
+// channel only determines how a message arrives and leaves (see
+// channel-adapter.js); it can never change what the conversation understands.
+//
+// `touchpoint` may be null: channel-originated conversations existing without
+// a QR touchpoint still run the full engine (lead capture, sales state,
+// funnel events) scoped to their business.
+async function runConversationEngine({ touchpoint = null, business = null, agent, conversation, message, targetLanguage }) {
+  const businessId = business ? business.id : (touchpoint ? touchpoint.business_id : null);
+  if (!businessId) throw new Error('runConversationEngine requires a business');
+  const owner = business || await getBusinessById(businessId);
+
+  const history = await listConversationMessages(conversation.id);
+
+  // Batch 2: resolve the server-authoritative business facts and sales state
+  // BEFORE the reply so the prompt guides the agent. The catalog is fetched
+  // after the conversation resolves to its tenant — never sent to a client
+  // payload, whatever the channel.
+  const products = await listProducts(businessId, { status: 'active' });
+  const lead = await findLeadByConversation(businessId, conversation.id);
+  const salesState = deriveSalesState({
+    conversation,
+    history,
+    customerMessage: message,
+    products,
+    lead,
+    channels: buildHandoffChannels(owner || {}),
+  });
+
+  let replyText;
+  try {
+    replyText = await runAgentChat({
+      agent,
+      history,
+      userInput: message,
+      targetLanguage,
+      salesState,
+      products,
+      handoff: owner || {},
+    });
+  } catch (error) {
+    // Never surface the provider error to a customer: log the full detail
+    // server-side and fall through to the same graceful reply used for an
+    // empty AI response, so the conversation continues and nothing internal
+    // leaks to the public endpoint.
+    console.error("[Conversation Engine] Groq Error:", error);
+  }
+
+  if (typeof replyText !== 'string' || !replyText.trim()) {
+    replyText = AI_FALLBACK_REPLY;
+  }
+
+  await addConversationMessage({ conversationId: conversation.id, role: 'user', text: message });
+  await addConversationMessage({ conversationId: conversation.id, role: 'assistant', text: replyText });
+
+  // Question memory: record the question the agent just asked so a resumed
+  // conversation never repeats it. The server owns this; the LLM is never
+  // trusted to remember it from the transcript.
+  const asked = extractQuestion(replyText);
+  const finalState = {
+    ...salesState,
+    questionsAsked: mergeQuestions(salesState.questionsAsked, asked ? [asked] : []),
+  };
+  try {
+    await updateConversationSalesState(conversation.id, finalState);
+  } catch (error) {
+    console.error('[Sales State] Persistence failed:', error);
+  }
+
+  // Phase 5: extract and persist a lead from the exchange. Failures here are
+  // logged and swallowed so a transient AI hiccup never breaks the chat. The
+  // freshly derived state is passed in so deterministic captures made by THIS
+  // message are authoritative immediately, never lagging by a message.
+  try {
+    await captureLeadFromConversation({
+      conversation,
+      touchpoint,
+      businessId,
+      touchpointId: touchpoint ? touchpoint.id : null,
+      agent,
+      salesState: finalState,
+    });
+  } catch (error) {
+    console.error('[Lead Capture] Extraction error:', error);
+  }
+
+  // Batch 3 funnel events: each records a transition the application actually
+  // observed between the persisted state before this message and the new state.
+  // Offer/start events are deduped per conversation so restating the same
+  // configured channel does not inflate analytics; a genuinely different action
+  // or channel set still records.
+  const prevState = (conversation && conversation.salesState) || {};
+  try {
+    if (!prevState.recommendedProductId && finalState.recommendedProductId) {
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'recommendation_made', meta: { productId: finalState.recommendedProductId } });
+    }
+    if (!prevState.buyingSignal && finalState.buyingSignal) {
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'buying_signal_detected' });
+    }
+    if (!prevState.objection && finalState.objection) {
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'objection_detected', meta: { type: finalState.objection } });
+    }
+    if (finalState.nextBestAction === 'offer_booking') {
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'booking_started', key: finalState.nextBestAction });
+    }
+    if (finalState.nextBestAction === 'offer_quote') {
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'quote_requested', key: finalState.nextBestAction });
+    }
+    if (finalState.nextBestAction === 'offer_demo') {
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'demo_requested', key: finalState.nextBestAction });
+    }
+    if (finalState.nextBestAction === 'close' && detectConversionAction(message) === 'purchase') {
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'purchase_started', key: finalState.nextBestAction });
+    }
+    const configuredChannels = buildHandoffChannels(owner || {});
+    const offeredTypes = channelsOfferedInReply(replyText, configuredChannels);
+    if (offeredTypes.length > 0) {
+      const offeredKey = `${finalState.nextBestAction || 'handoff'}:${offeredTypes.join('+')}`;
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'handoff_offered', key: offeredKey, meta: { action: finalState.nextBestAction || null, channels: offeredTypes } });
+    }
+  } catch (error) {
+    console.error('[Funnel Events] Recording failed:', error);
+  }
+
+  const fresh = await getConversationById(conversation.id);
+  const response = {
+    conversationId: conversation.id,
+    customerName: fresh.customer_name || null,
+    targetLanguage: fresh.target_language,
+    channel: fresh.channel || 'web',
+    agent: { name: fresh.agent_name },
+    messages: await listConversationMessages(conversation.id),
+  };
+
+  // Customer-facing handoff: when the next-best-action is a genuine offer and
+  // channels are configured, the customer receives the actual destinations they
+  // can act on. Only configured, real values are ever returned, and only for
+  // offer actions — internal sales state is never included.
+  const handoffChannels = buildHandoffChannels(owner || {});
+  if (handoffChannels.length > 0 && HANDOFF_ACTION_NBAS.has(finalState.nextBestAction)) {
+    response.handoff = customerHandoffDestinations(handoffChannels);
+  }
+
+  return response;
+}
+
 // Send a message in a public touchpoint conversation. Creates the conversation
 // on first contact, persists both sides of the exchange, and drives the same
 // Groq logic as the authenticated sandbox.
@@ -2945,129 +3137,15 @@ app.post('/v1/t/:trackingId/messages', asyncHandler(async (req, res) => {
     return res.status(500).json({ error: 'The assigned agent is unavailable' });
   }
 
-  const history = await listConversationMessages(conversation.id);
-
-  // Batch 2: resolve the server-authoritative business facts and sales state
-  // BEFORE the reply so the prompt guides the agent. The catalog is fetched
-  // after the public touchpoint resolves to its tenant — never sent to the
-  // browser payload.
   const business = await getBusinessById(touchpoint.business_id);
-  const products = await listProducts(touchpoint.business_id, { status: 'active' });
-  const lead = await findLeadByConversation(touchpoint.business_id, conversation.id);
-  const salesState = deriveSalesState({
+  const response = await runConversationEngine({
+    touchpoint,
+    business,
+    agent,
     conversation,
-    history,
-    customerMessage: message,
-    products,
-    lead,
-    channels: buildHandoffChannels(business || {}),
+    message,
+    targetLanguage,
   });
-
-  let replyText;
-  try {
-    replyText = await runAgentChat({
-      agent,
-      history,
-      userInput: message,
-      targetLanguage,
-      salesState,
-      products,
-      handoff: business || {},
-    });
-  } catch (error) {
-    // Never surface the provider error to a customer: log the full detail
-    // server-side and fall through to the same graceful reply used for an
-    // empty AI response, so the conversation continues and nothing internal
-    // leaks to the public endpoint.
-    console.error("[Public Touchpoint] Groq Error:", error);
-  }
-
-  if (typeof replyText !== 'string' || !replyText.trim()) {
-    replyText = AI_FALLBACK_REPLY;
-  }
-
-  await addConversationMessage({ conversationId: conversation.id, role: 'user', text: message });
-  await addConversationMessage({ conversationId: conversation.id, role: 'assistant', text: replyText });
-
-  // Question memory: record the question the agent just asked so a resumed
-  // conversation never repeats it. The server owns this; the LLM is never
-  // trusted to remember it from the transcript.
-  const asked = extractQuestion(replyText);
-  const finalState = {
-    ...salesState,
-    questionsAsked: mergeQuestions(salesState.questionsAsked, asked ? [asked] : []),
-  };
-  try {
-    await updateConversationSalesState(conversation.id, finalState);
-  } catch (error) {
-    console.error('[Sales State] Persistence failed:', error);
-  }
-
-  // Phase 5: extract and persist a lead from the exchange. Failures here are
-  // logged and swallowed so a transient AI hiccup never breaks the chat. The
-  // freshly derived state is passed in so deterministic captures made by THIS
-  // message are authoritative immediately, never lagging by a message.
-  try {
-    await captureLeadFromConversation({ conversation, touchpoint, agent, salesState: finalState });
-  } catch (error) {
-    console.error('[Lead Capture] Extraction error:', error);
-  }
-
-  // Batch 3 funnel events: each records a transition the application actually
-  // observed between the persisted state before this message and the new state.
-  // Offer/start events are deduped per conversation so restating the same
-  // configured channel does not inflate analytics; a genuinely different action
-  // or channel set still records.
-  const prevState = (conversation && conversation.salesState) || {};
-  try {
-    if (!prevState.recommendedProductId && finalState.recommendedProductId) {
-      await recordFunnelEvent({ businessId: business.id, conversationId: conversation.id, eventType: 'recommendation_made', meta: { productId: finalState.recommendedProductId } });
-    }
-    if (!prevState.buyingSignal && finalState.buyingSignal) {
-      await recordFunnelEvent({ businessId: business.id, conversationId: conversation.id, eventType: 'buying_signal_detected' });
-    }
-    if (!prevState.objection && finalState.objection) {
-      await recordFunnelEvent({ businessId: business.id, conversationId: conversation.id, eventType: 'objection_detected', meta: { type: finalState.objection } });
-    }
-    if (finalState.nextBestAction === 'offer_booking') {
-      await recordFunnelEventOnce({ businessId: business.id, conversationId: conversation.id, eventType: 'booking_started', key: finalState.nextBestAction });
-    }
-    if (finalState.nextBestAction === 'offer_quote') {
-      await recordFunnelEventOnce({ businessId: business.id, conversationId: conversation.id, eventType: 'quote_requested', key: finalState.nextBestAction });
-    }
-    if (finalState.nextBestAction === 'offer_demo') {
-      await recordFunnelEventOnce({ businessId: business.id, conversationId: conversation.id, eventType: 'demo_requested', key: finalState.nextBestAction });
-    }
-    if (finalState.nextBestAction === 'close' && detectConversionAction(message) === 'purchase') {
-      await recordFunnelEventOnce({ businessId: business.id, conversationId: conversation.id, eventType: 'purchase_started', key: finalState.nextBestAction });
-    }
-    const configuredChannels = buildHandoffChannels(business || {});
-    const offeredTypes = channelsOfferedInReply(replyText, configuredChannels);
-    if (offeredTypes.length > 0) {
-      const offeredKey = `${finalState.nextBestAction || 'handoff'}:${offeredTypes.join('+')}`;
-      await recordFunnelEventOnce({ businessId: business.id, conversationId: conversation.id, eventType: 'handoff_offered', key: offeredKey, meta: { action: finalState.nextBestAction || null, channels: offeredTypes } });
-    }
-  } catch (error) {
-    console.error('[Funnel Events] Recording failed:', error);
-  }
-
-  const fresh = await getConversationById(conversation.id);
-  const response = {
-    conversationId: conversation.id,
-    customerName: fresh.customer_name || null,
-    targetLanguage: fresh.target_language,
-    agent: { name: fresh.agent_name },
-    messages: await listConversationMessages(conversation.id),
-  };
-
-  // Customer-facing handoff: when the next-best-action is a genuine offer and
-  // channels are configured, the customer receives the actual destinations they
-  // can act on. Only configured, real values are ever returned, and only for
-  // offer actions — internal sales state is never included.
-  const handoffChannels = buildHandoffChannels(business || {});
-  if (handoffChannels.length > 0 && HANDOFF_ACTION_NBAS.has(finalState.nextBestAction)) {
-    response.handoff = customerHandoffDestinations(handoffChannels);
-  }
 
   res.json(response);
 }));;
@@ -3110,6 +3188,7 @@ app.get('/v1/conversations', asyncHandler(async (req, res) => {
     agentName: c.agent_name,
     customerName: c.customer_name,
     targetLanguage: c.target_language,
+    channel: c.channel || 'web',
     lastMessage: c.last_message,
     messageCount: c.message_count,
     createdAt: c.created_at,
@@ -3808,6 +3887,548 @@ app.get('/v1/billing/verify', asyncHandler(async (req, res) => {
   res.json({
     transaction: { reference, status: (await getPaystackTransaction(reference)).status },
     subscription: await getPublicSubscription(req.business.id),
+  });
+}));
+
+/**
+ * PHASE 13A: COMMERCIAL TRANSACTIONS
+ *
+ * Deterministic commercial actions and orders. The AI may propose an action;
+ * only the server may execute one, and only after deterministic validation.
+ * Prices and totals always come from the authoritative product catalog; order
+ * state moves through a compare-and-set state machine; and nothing in this
+ * phase, or in any LLM payload, can set an order PAID or FULFILLED — those
+ * transitions await verified payment-provider events.
+ */
+
+const COMMERCIAL_ACTION_TYPES = new Set([
+  'REQUEST_QUOTE',
+  'START_ORDER',
+  'BOOK',
+  'START_PAYMENT',
+  'REQUEST_DEMO',
+  'TALK_TO_HUMAN',
+]);
+
+const ORDER_STATUSES = new Set([
+  'draft',
+  'pending_payment',
+  'paid',
+  'fulfillment_pending',
+  'fulfilled',
+  'cancelled',
+]);
+
+// The Phase 13A state machine. Only these transitions are legal; 'paid',
+// 'fulfillment_pending' and 'fulfilled' are LOCKED in this phase (no verified
+// payment authorizer exists yet), so nothing here can move an order into or
+// out of a paid/fulfilled state except the verified-provider events of a later
+// phase.
+const ORDER_TRANSITIONS = {
+  draft: ['pending_payment', 'cancelled'],
+  pending_payment: ['cancelled'],
+  paid: [],
+  fulfillment_pending: [],
+  fulfilled: [],
+  cancelled: [],
+};
+
+const cleanMoney = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const rounded = Math.round(n * 100) / 100;
+  return rounded >= 0 ? rounded : null;
+};
+
+const cleanQuantity = (value) => {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 10000) return null;
+  return n;
+};
+
+function validateOrderItemsPayload(body, { businessId }) {
+  const itemsRaw = Array.isArray(body.items) ? body.items : null;
+  if (!itemsRaw) return null;
+  if (itemsRaw.length === 0 || itemsRaw.length > 50) return null;
+
+  const merged = new Map();
+  for (const raw of itemsRaw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const productId = typeof raw.productId === 'string' ? raw.productId.trim() : '';
+    const quantity = cleanQuantity(raw.quantity === undefined ? 1 : raw.quantity);
+    if (!productId || productId.length > 64 || !quantity) return null;
+    merged.set(productId, Math.min(10000, (merged.get(productId) || 0) + quantity));
+  }
+  return Array.from(merged.entries()).map(([productId, quantity]) => ({ productId, quantity }));
+}
+
+async function resolveOrderableProducts(businessId, items) {
+  const resolved = [];
+  for (const item of items) {
+    const product = await getProductById(businessId, item.productId);
+    if (!product || product.status !== 'active') return null;
+    resolved.push({
+      productId: product.id,
+      productName: product.name,
+      quantity: item.quantity,
+      unitPrice: cleanMoney(product.price),
+      metadata: null,
+    });
+  }
+  return resolved;
+}
+
+const publicOrder = (order) => ({
+  id: order.id,
+  businessId: order.business_id,
+  conversationId: order.conversation_id,
+  leadId: order.lead_id,
+  channel: order.channel,
+  customerName: order.customer_name,
+  status: order.status,
+  currency: order.currency,
+  subtotal: Number(order.subtotal),
+  total: Number(order.total),
+  paymentStatus: order.payment_status,
+  fulfillmentStatus: order.fulfillment_status,
+  metadata: order.metadata || {},
+  items: Array.isArray(order.items) ? order.items.map((i) => ({
+    id: i.id,
+    productId: i.product_id,
+    productName: i.product_name,
+    quantity: i.quantity,
+    unitPrice: Number(i.unit_price),
+    total: Number(i.total),
+  })) : undefined,
+  createdAt: order.created_at,
+  updatedAt: order.updated_at,
+});
+
+const publicCommercialAction = (a) => ({
+  id: a.id,
+  conversationId: a.conversation_id,
+  actionType: a.action_type,
+  status: a.status,
+  leadId: a.lead_id,
+  productId: a.product_id,
+  orderId: a.order_id,
+  customer: a.customer || {},
+  metadata: a.metadata || {},
+  createdAt: a.created_at,
+  updatedAt: a.updated_at,
+});
+
+const COMMERCIAL_ACTION_STATUSES = new Set(['proposed', 'executed', 'rejected']);
+
+// Create an order. Items are validated against the business's OWN catalog; the
+// server computes every monetary figure from the authoritative product price.
+app.post('/v1/orders', requireAuth, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const items = validateOrderItemsPayload(body, { businessId: req.business.id });
+  if (!items) {
+    return res.status(400).json({ error: 'items must be a non-empty array of { productId, quantity } products owned by this business' });
+  }
+  const resolved = await resolveOrderableProducts(req.business.id, items);
+  if (!resolved) {
+    return res.status(400).json({ error: 'every item must reference an active product owned by this business' });
+  }
+
+  let conversationId = null;
+  let leadId = null;
+  if (body.conversationId !== undefined && body.conversationId !== null && body.conversationId !== '') {
+    if (typeof body.conversationId !== 'string') {
+      return res.status(400).json({ error: 'conversationId must be a string' });
+    }
+    const conversation = await getConversationById(body.conversationId);
+    if (!conversation || conversation.business_id !== req.business.id) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    conversationId = conversation.id;
+    const existingLead = await findLeadByConversation(req.business.id, conversation.id);
+    leadId = existingLead ? existingLead.id : null;
+  }
+
+  const currency = body.currency !== undefined && body.currency !== null
+    ? String(body.currency).trim().toUpperCase()
+    : (resolved[0].unitPrice != null ? 'NGN' : 'NGN');
+  if (!PRODUCT_CURRENCIES.includes(currency)) {
+    return res.status(400).json({ error: `currency must be one of: ${PRODUCT_CURRENCIES.join(', ')}` });
+  }
+
+  const customerName = typeof body.customerName === 'string' ? body.customerName.trim().slice(0, 120) || null : null;
+
+  // The request can never set status, totals or payment state.
+  const created = await createOrderRecord({
+    businessId: req.business.id,
+    conversationId,
+    leadId,
+    channel: 'web',
+    customerName,
+    currency,
+    lines: resolved,
+  });
+
+  await recordFunnelEventOnce({
+    businessId: req.business.id,
+    conversationId,
+    eventType: 'order_created',
+    key: `order:${created.orderId}`,
+    meta: { orderId: created.orderId, items: resolved.length, total: created.total, currency },
+  });
+
+  const full = await getOrderById(req.business.id, created.orderId);
+  res.status(201).json({ order: publicOrder(full) });
+}));
+
+// List the authenticated business's orders.
+app.get('/v1/orders', requireAuth, asyncHandler(async (req, res) => {
+  const orders = await listOrders(req.business.id);
+  res.status(200).json({ orders: orders.map((o) => ({ ...publicOrder(o), itemCount: o.item_count })) });
+}));
+
+// Fetch a single order with its lines. Scoped to the authenticated business.
+app.get('/v1/orders/:id', requireAuth, asyncHandler(async (req, res) => {
+  const order = await getOrderById(req.business.id, req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  res.status(200).json({ order: publicOrder(order) });
+}));
+
+// Start payment on a draft order. Only a draft may enter pending_payment, and
+// even then payment_status is only ever set to 'pending' here: 'paid' can only
+// arrive via a verified payment-provider event in a later phase.
+app.post('/v1/orders/:id/start-payment', requireAuth, asyncHandler(async (req, res) => {
+  const order = await getOrderById(req.business.id, req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (order.items.length === 0) return res.status(409).json({ error: 'Order has no items', code: 'ORDER_EMPTY' });
+  if (!ORDER_TRANSITIONS[order.status] || !ORDER_TRANSITIONS[order.status].includes('pending_payment')) {
+    return res.status(409).json({ error: `Order cannot transition ${order.status} -> pending_payment`, code: 'INVALID_TRANSITION' });
+  }
+  const moved = await setOrderStatus(req.business.id, order.id, 'pending_payment', 'draft');
+  if (!moved) return res.status(409).json({ error: 'Order state changed while processing; retry', code: 'STALE_STATE' });
+  await setOrderPaymentStatus(req.business.id, order.id, 'pending');
+  await recordFunnelEventOnce({
+    businessId: req.business.id,
+    conversationId: order.conversation_id,
+    eventType: 'payment_started',
+    key: `order:${order.id}:payment`,
+    meta: { orderId: order.id },
+  });
+  const fresh = await getOrderById(req.business.id, order.id);
+  res.status(200).json({ order: publicOrder(fresh) });
+}));
+
+// Cancel an order. Only draft or pending_payment orders may be cancelled in
+// Phase 13A (paid/fulfilled are locked). A verified provider event can cancel
+// an abandoned paid charge in a later phase.
+app.post('/v1/orders/:id/cancel', requireAuth, asyncHandler(async (req, res) => {
+  const order = await getOrderById(req.business.id, req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (!ORDER_TRANSITIONS[order.status] || !ORDER_TRANSITIONS[order.status].includes('cancelled')) {
+    return res.status(409).json({ error: `Order cannot be cancelled from ${order.status}`, code: 'INVALID_TRANSITION' });
+  }
+  const moved = await setOrderStatus(req.business.id, order.id, 'cancelled', order.status);
+  if (!moved) return res.status(409).json({ error: 'Order state changed while processing; retry', code: 'STALE_STATE' });
+  await recordFunnelEventOnce({
+    businessId: req.business.id,
+    conversationId: order.conversation_id,
+    eventType: 'order_cancelled',
+    key: `order:${order.id}:cancelled`,
+    meta: { orderId: order.id, wasPendingPayment: order.status === 'pending_payment' },
+  });
+  const fresh = await getOrderById(req.business.id, order.id);
+  res.status(200).json({ order: publicOrder(fresh) });
+}));
+
+// Add a line to an order. Allowed only while the order is still mutable
+// (draft). The unit price comes from the authoritative product, never from the
+// request.
+app.post('/v1/orders/:id/items', requireAuth, asyncHandler(async (req, res) => {
+  const order = await getOrderById(req.business.id, req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (order.status !== 'draft') {
+    return res.status(409).json({ error: 'Items can only be added to a draft order', code: 'ORDER_LOCKED' });
+  }
+  const items = validateOrderItemsPayload(req.body || {}, { businessId: req.business.id });
+  if (!items || items.length !== 1) {
+    return res.status(400).json({ error: 'items must be a single-item array of { productId, quantity }' });
+  }
+  const resolved = await resolveOrderableProducts(req.business.id, items);
+  if (!resolved) return res.status(400).json({ error: 'item must reference an active product owned by this business' });
+  const result = await addOrderItemRecord(req.business.id, order.id, resolved[0]);
+  if (!result) return res.status(404).json({ error: 'Order not found' });
+  if (result.duplicate) {
+    return res.status(409).json({ error: 'Product already exists on this order', code: 'DUPLICATE_LINE' });
+  }
+  await recordFunnelEventOnce({
+    businessId: req.business.id,
+    conversationId: order.conversation_id,
+    eventType: 'order_item_added',
+    key: `order:${order.id}:item:${resolved[0].productId}`,
+    meta: { orderId: order.id, productId: resolved[0].productId },
+  });
+  const fresh = await getOrderById(req.business.id, order.id);
+  res.status(200).json({ order: publicOrder(fresh) });
+}));
+
+// COMMERCIAL ACTIONS
+//
+// Propose an action. This is the ONLY way an action enters the system and it is
+// always stored 'proposed' — a request body can never set status. Each proposal
+// is validated deterministically: known action type, owned conversation, owned
+// product, owned order.
+app.post('/v1/commercial/actions/propose', requireAuth, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const actionType = typeof body.actionType === 'string' ? body.actionType.trim().toUpperCase() : '';
+  if (!COMMERCIAL_ACTION_TYPES.has(actionType)) {
+    return res.status(400).json({ error: `actionType must be one of: ${Array.from(COMMERCIAL_ACTION_TYPES).join(', ')}` });
+  }
+
+  let conversationId = null;
+  if (body.conversationId !== undefined && body.conversationId !== null && body.conversationId !== '') {
+    if (typeof body.conversationId !== 'string') {
+      return res.status(400).json({ error: 'conversationId must be a string' });
+    }
+    const conversation = await getConversationById(body.conversationId);
+    if (!conversation || conversation.business_id !== req.business.id) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    conversationId = conversation.id;
+  }
+
+  let productId = null;
+  if (body.productId !== undefined && body.productId !== null && body.productId !== '') {
+    if (typeof body.productId !== 'string') productId = null;
+    else {
+      const product = await getProductById(req.business.id, body.productId);
+      if (!product) return res.status(400).json({ error: 'productId must reference a product owned by this business' });
+      if (product.status !== 'active') return res.status(400).json({ error: 'productId must reference an active product' });
+      productId = product.id;
+    }
+  }
+
+  let orderId = null;
+  if (body.orderId !== undefined && body.orderId !== null && body.orderId !== '') {
+    if (typeof body.orderId !== 'string') orderId = null;
+    else {
+      const order = await getOrderById(req.business.id, body.orderId);
+      if (!order) return res.status(400).json({ error: 'orderId must reference an order owned by this business' });
+      orderId = order.id;
+    }
+  }
+
+  const customer = body.customer && typeof body.customer === 'object' && !Array.isArray(body.customer)
+    ? {
+        name: cleanName(body.customer.name),
+        phone: cleanPhone(body.customer.phone),
+        email: cleanEmail(body.customer.email),
+      }
+    : {};
+
+  const metadata = body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata) ? body.metadata : {};
+
+  const action = await createCommercialAction({
+    businessId: req.business.id,
+    conversationId,
+    actionType,
+    productId,
+    orderId,
+    customer,
+    metadata,
+  });
+  res.status(201).json({ action: publicCommercialAction(action) });
+}));
+
+// List the authenticated business's commercial actions (optional ?status filter).
+app.get('/v1/commercial/actions', requireAuth, asyncHandler(async (req, res) => {
+  const status = typeof req.query.status === 'string' && COMMERCIAL_ACTION_STATUSES.has(req.query.status) ? req.query.status : null;
+  const actions = await listCommercialActions(req.business.id, { status });
+  res.status(200).json({ actions: actions.map(publicCommercialAction) });
+}));
+
+/**
+ * Executes a proposed commercial action. Execution means the SERVER performed
+ * the underlying work (or determined it cannot), never that the AI claimed it.
+ * Phase 13A backs exactly one action: START_ORDER — it executes only when an
+ * order already exists for the same business+conversation. Everything else
+ * returns 409 ACTION_NOT_EXECUTABLE because no server-side backing exists yet
+ * (REQUEST_QUOTE/BOOK/REQUEST_DEMO/TALK_TO_HUMAN are configured handoffs; a
+ * payment-authorizer produces real payments later).
+ */
+app.post('/v1/commercial/actions/:id/execute', requireAuth, asyncHandler(async (req, res) => {
+  const action = await getCommercialAction(req.business.id, req.params.id);
+  if (!action) return res.status(404).json({ error: 'Action not found' });
+  if (action.status !== 'proposed') {
+    return res.status(409).json({ error: `Action is already ${action.status}`, code: 'ACTION_NOT_PROPOSED' });
+  }
+
+  if (action.action_type === 'START_ORDER' && action.conversation_id) {
+    const orders = await listOrdersByConversation(req.business.id, action.conversation_id);
+    if (orders.length === 0) {
+      return res.status(409).json({ error: 'No order exists for this conversation to start.', code: 'ACTION_NOT_EXECUTABLE' });
+    }
+    const moved = await setCommercialActionStatus(req.business.id, action.id, 'executed', 'proposed');
+    if (!moved) return res.status(409).json({ error: 'Action state changed while processing; retry', code: 'STALE_STATE' });
+    await linkCommercialActionOrder(req.business.id, action.id, orders[0].id);
+    const fresh = await getCommercialAction(req.business.id, action.id);
+    return res.status(200).json({ action: publicCommercialAction(fresh) });
+  }
+
+  if (action.action_type === 'REQUEST_QUOTE' || action.action_type === 'BOOK'
+    || action.action_type === 'REQUEST_DEMO' || action.action_type === 'TALK_TO_HUMAN'
+    || action.action_type === 'START_PAYMENT') {
+    return res.status(409).json({ error: 'This action type has no server-side executor yet in Phase 13A.', code: 'ACTION_NOT_EXECUTABLE' });
+  }
+
+  return res.status(409).json({ error: 'Action cannot be executed', code: 'ACTION_NOT_EXECUTABLE' });
+}));
+
+// CHANNEL CONFIGURATION (public settings only)
+//
+// Business-level channel flags: enabled/status/displayName. Credentials and
+// provider secrets never belong in code, seeds, tests, logs, or this table —
+// they arrive from the deployment environment when a real provider is wired.
+const CHANNEL_CONFIG_KEY_PATTERN = /token|secret|key|webhook|credential/i;
+
+app.get('/v1/business/channels', requireAuth, asyncHandler(async (req, res) => {
+  const configs = await listChannelConfigs(req.business.id);
+  res.status(200).json({
+    channels: configs.map((c) => ({
+      channel: c.channel,
+      enabled: c.enabled,
+      status: c.status,
+      displayName: c.display_name,
+    })),
+  });
+}));
+
+app.put('/v1/business/channels/:channel', requireAuth, asyncHandler(async (req, res) => {
+  let channel;
+  try {
+    channel = assertChannel(req.params.channel);
+  } catch (e) {
+    return res.status(400).json({ error: `channel must be one of: ${SUPPORTED_CHANNELS.join(', ')}` });
+  }
+
+  const body = req.body || {};
+  const fields = {};
+  for (const [key, value] of Object.entries(body)) {
+    const normalized = typeof key === 'string' ? key.trim().toLowerCase() : '';
+    if (CHANNEL_CONFIG_KEY_PATTERN.test(normalized)) {
+      return res.status(400).json({ error: 'Validation failed', fields: { [key]: 'Provider credentials/secrets are not accepted here; configure them in the deployment environment.' } });
+    }
+    fields[key] = value;
+  }
+
+  if (fields.enabled !== undefined && typeof fields.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'Validation failed', fields: { enabled: 'enabled must be a boolean' } });
+  }
+  if (fields.displayName !== undefined) {
+    if (typeof fields.displayName !== 'string' || fields.displayName.trim().length === 0 || fields.displayName.length > 40) {
+      return res.status(400).json({ error: 'Validation failed', fields: { displayName: 'displayName must be 1-40 characters' } });
+    }
+    fields.displayName = fields.displayName.trim();
+  }
+
+  const config = await upsertChannelConfig(req.business.id, channel, {
+    enabled: fields.enabled,
+    status: fields.status,
+    displayName: fields.displayName,
+  });
+
+  res.status(200).json({
+    channel: {
+      channel: config.channel,
+      enabled: config.enabled,
+      status: config.status,
+      displayName: config.display_name,
+    },
+  });
+}));
+
+// WHATSAPP CHANNEL (Phase 13A mock boundary)
+//
+// This is the inbound webhook boundary a real WhatsApp Cloud API webhook will
+// verify (signature + verify-token) and forward to. Phase 13A implements only
+// the internal abstraction and a labeled mock: the endpoint is reachable, runs
+// the SAME conversation engine as the web chat, and responds with a mock
+// outbound envelope. No Meta credential exists anywhere, so the endpoint is
+// disabled outside test mode.
+app.post('/v1/channel/whatsapp/inbound', asyncHandler(async (req, res) => {
+  if (!isTest) {
+    return res.status(501).json({ error: 'WhatsApp Cloud API is not configured yet' });
+  }
+
+  const body = req.body || {};
+
+  // Optional handshake verification, mirroring Meta's hub verification. Only
+  // active when the deployment supplies WHATSAPP_VERIFY_TOKEN — Phase 13A tests
+  // never rely on it, so the mock stays meaningful without any credential.
+  if (process.env.WHATSAPP_VERIFY_TOKEN) {
+    const queryToken = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
+    if (queryToken !== process.env.WHATSAPP_VERIFY_TOKEN) {
+      return res.status(403).json({ error: 'Invalid verification token' });
+    }
+  }
+
+  const businessId = typeof body.businessId === 'string' ? body.businessId.trim() : '';
+  if (!businessId) return res.status(400).json({ error: 'businessId is required' });
+  const business = await getBusinessById(businessId);
+  if (!business) return res.status(404).json({ error: 'Business not found' });
+
+  const externalId = typeof body.from === 'string' ? body.from.trim() : '';
+  if (!externalId) return res.status(400).json({ error: 'from is required' });
+  if (externalId.length > 60) return res.status(400).json({ error: 'from must be 60 characters or fewer' });
+
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  if (!message || message.length > 2000) {
+    return res.status(400).json({ error: 'message must be 1-2000 characters' });
+  }
+
+  const channel = CHANNELS.WHATSAPP;
+
+  const identity = await getChannelIdentity(businessId, channel, externalId);
+  let conversation = identity ? await getConversationById(identity.conversation_id) : null;
+
+  const agent = await findDefaultAgent(businessId);
+  if (!agent) return res.status(409).json({ error: 'Business has no active agent to handle this channel' });
+
+  if (!conversation) {
+    conversation = await createConversation({
+      businessId,
+      agentId: agent.id,
+      targetLanguage: typeof body.targetLanguage === 'string' ? body.targetLanguage.trim().toLowerCase().slice(0, 8) : 'en',
+      channel: channel,
+    });
+    await createChannelIdentity({
+      businessId,
+      channel: channel,
+      externalId,
+      conversationId: conversation.id,
+    });
+  }
+
+  const response = await runConversationEngine({
+    business,
+    agent,
+    conversation,
+    message,
+    targetLanguage: conversation.target_language || 'en',
+  });
+
+  const outbound = sendChannelMessage({
+    channel: channel,
+    destination: externalId,
+    text: response.messages && response.messages.length > 0
+      ? response.messages[response.messages.length - 1].text
+      : response.conversationId,
+  });
+
+  res.status(200).json({
+    conversationId: conversation.id,
+    channel: channel,
+    agent: response.agent,
+    outbound,
+    messages: response.messages,
   });
 }));
 

@@ -7,7 +7,14 @@ const { Pool } = pg;
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  // Keep shared/idle connections alive and bound the wait for a free slot, so
+  // a stale socket (e.g. a provider-side idle reset) degrades into a fast,
+  // retryable error instead of silently wedging the request queue.
+  keepAlive: true,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 10,
 });
 
 /**
@@ -572,7 +579,7 @@ export async function recordScan({ touchpointId, businessId, userAgent }) {
 
 const CONVERSATION_COLUMNS = `
   c.id, c.business_id, c.touchpoint_id, c.agent_id, c.customer_name,
-  c.target_language, c.stage, c.intent, c.customer_need,
+  c.target_language, c.channel, c.stage, c.intent, c.customer_need,
   c.recommended_product_id, c.buying_signal, c.objection, c.contact_declined,
   c.questions_asked, c.captured_lead_fields, c.next_best_action,
   c.created_at, c.updated_at,
@@ -596,11 +603,15 @@ function decodeSalesState(conversation) {
   };
 }
 
-export async function createConversation({ touchpoint, agentId, customerName, targetLanguage }) {
+export async function createConversation({ touchpoint = null, businessId = null, touchpointId = null, agentId, customerName = null, targetLanguage = 'en', channel = 'web' }) {
   const id = crypto.randomUUID();
+  const biz = touchpoint ? touchpoint.business_id : businessId;
+  if (!biz) throw new Error('createConversation requires a business');
+  const tp = touchpoint ? touchpoint.id : touchpointId;
   await pool.query(
-    'INSERT INTO conversations (id, business_id, touchpoint_id, agent_id, customer_name, target_language) VALUES ($1, $2, $3, $4, $5, $6)',
-    [id, touchpoint.business_id, touchpoint.id, agentId, customerName || null, targetLanguage || 'en']
+    `INSERT INTO conversations (id, business_id, touchpoint_id, agent_id, customer_name, target_language, channel)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, biz, tp || null, agentId, customerName || null, targetLanguage || 'en', channel || 'web']
   );
   return getConversationById(id);
 }
@@ -608,7 +619,7 @@ export async function createConversation({ touchpoint, agentId, customerName, ta
 export async function getConversationById(id) {
   const res = await pool.query(`
     SELECT ${CONVERSATION_COLUMNS} FROM conversations c
-    JOIN touchpoints tp ON tp.id = c.touchpoint_id
+    LEFT JOIN touchpoints tp ON tp.id = c.touchpoint_id
     JOIN agents a ON a.id = c.agent_id
     WHERE c.id = $1
   `, [id]);
@@ -659,7 +670,7 @@ export async function listConversations(businessId) {
       (SELECT COUNT(*)::int FROM conversation_messages m
        WHERE m.conversation_id = c.id) AS message_count
     FROM conversations c
-    JOIN touchpoints tp ON tp.id = c.touchpoint_id
+    LEFT JOIN touchpoints tp ON tp.id = c.touchpoint_id
     JOIN agents a ON a.id = c.agent_id
     WHERE c.business_id = $1
     ORDER BY c.updated_at DESC
@@ -1150,4 +1161,308 @@ export async function updateUserPassword(userId, passwordHash) {
     'UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
     [passwordHash, userId]
   );
+}
+
+/**
+ * COMMERCIAL TRANSACTIONS (Phase 13A)
+ *
+ * Orders are deterministic: totals are always computed by the server from the
+ * authoritative product price; a client body can never influence money
+ * figures. Status transitions are compare-and-set so the state machine is the
+ * single source of truth even under concurrency.
+ */
+
+const ORDER_COLUMNS = `
+  o.id, o.business_id, o.conversation_id, o.lead_id, o.channel, o.customer_name,
+  o.status, o.currency, o.subtotal, o.total, o.payment_status,
+  o.fulfillment_status, o.metadata, o.created_at, o.updated_at
+`;
+
+const parseMoney = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+};
+
+export async function createOrderRecord({ businessId, conversationId = null, leadId = null, channel = 'web', customerName = null, currency = 'NGN', lines, metadata = null }) {
+  const orderId = crypto.randomUUID();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO orders (id, business_id, conversation_id, lead_id, channel, customer_name, currency)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [orderId, businessId, conversationId || null, leadId || null, channel || 'web', customerName || null, currency]
+    );
+    const items = [];
+    let subtotal = 0;
+    for (const line of lines) {
+      const itemId = crypto.randomUUID();
+      const lineTotal = Math.round(line.quantity * line.unitPrice * 100) / 100;
+      subtotal = Math.round((subtotal + lineTotal) * 100) / 100;
+      await client.query(
+        `INSERT INTO order_items (id, order_id, product_id, product_name, quantity, unit_price, total, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [itemId, orderId, line.productId, line.productName, line.quantity, line.unitPrice, lineTotal, line.metadata || '{}']
+      );
+      items.push({ id: itemId, product_id: line.productId, product_name: line.productName, quantity: line.quantity, unit_price: line.unitPrice, total: lineTotal });
+    }
+    await client.query(
+      'UPDATE orders SET subtotal = $1, total = $2 WHERE id = $3',
+      [subtotal, subtotal, orderId]
+    );
+    await client.query('COMMIT');
+    return { orderId, items, subtotal, total: subtotal, currency };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getOrderById(businessId, id) {
+  const res = await pool.query(
+    `SELECT ${ORDER_COLUMNS} FROM orders o WHERE o.id = $1 AND o.business_id = $2`,
+    [id, businessId]
+  );
+  const order = res.rows[0] || null;
+  if (!order) return null;
+  const items = await pool.query(
+    `SELECT id, order_id, product_id, product_name, quantity, unit_price, total, metadata, created_at
+     FROM order_items WHERE order_id = $1 ORDER BY created_at ASC`,
+    [order.id]
+  );
+  return {
+    ...order,
+    subtotal: parseMoney(order.subtotal),
+    total: parseMoney(order.total),
+    items: items.rows.map((i) => ({ ...i, unit_price: parseMoney(i.unit_price), total: parseMoney(i.total) })),
+  };
+}
+
+export async function listOrders(businessId) {
+  const res = await pool.query(
+    `SELECT ${ORDER_COLUMNS},
+       (SELECT COUNT(*)::int FROM order_items oi WHERE oi.order_id = o.id) AS item_count
+     FROM orders o
+     WHERE o.business_id = $1
+     ORDER BY o.created_at DESC`,
+    [businessId]
+  );
+  return res.rows.map((o) => ({ ...o, subtotal: parseMoney(o.subtotal), total: parseMoney(o.total) }));
+}
+
+export async function listOrdersByConversation(businessId, conversationId) {
+  const res = await pool.query(`
+    SELECT ${ORDER_COLUMNS} FROM orders o
+    WHERE o.business_id = $1 AND o.conversation_id = $2
+    ORDER BY o.created_at DESC
+  `, [businessId, conversationId]);
+  return res.rows.map((o) => ({ ...o, subtotal: parseMoney(o.subtotal), total: parseMoney(o.total) }));
+}
+
+/**
+ * Compare-and-set order status transition. The allowed-transition policy lives
+ * in the server (ORDER_TRANSITIONS); this storage call moves a row only when
+ * its current status still matches the expected one, so two concurrent
+ * transition requests cannot both succeed.
+ */
+export async function setOrderStatus(businessId, id, nextStatus, expectedStatus) {
+  const res = await pool.query(
+    `UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3 AND status = $4
+     RETURNING id`,
+    [nextStatus, id, businessId, expectedStatus]
+  );
+  return res.rows.length > 0;
+}
+
+export async function setOrderPaymentStatus(businessId, id, paymentStatus) {
+  const res = await pool.query(
+    `UPDATE orders SET payment_status = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3`,
+    [paymentStatus, id, businessId]
+  );
+  return res.rowCount > 0;
+}
+
+export async function setOrderMetadata(businessId, id, metadata) {
+  await pool.query(
+    `UPDATE orders SET metadata = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3`,
+    [JSON.stringify(metadata || {}), id, businessId]
+  );
+}
+
+/**
+ * Adds a line to an existing order and recomputes its totals. Only used while
+ * the order is still in a mutable status (the server enforces that); the unit
+ * price always comes from the authoritative product, never from the request.
+ */
+export async function addOrderItemRecord(businessId, orderId, line) {
+  const order = await getOrderById(businessId, orderId);
+  if (!order) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const exists = await client.query(
+      'SELECT 1 FROM order_items WHERE order_id = $1 AND product_id = $2',
+      [orderId, line.productId]
+    );
+    if (exists.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return { duplicate: true };
+    }
+    const itemId = crypto.randomUUID();
+    const lineTotal = Math.round(line.quantity * line.unitPrice * 100) / 100;
+    await client.query(
+      `INSERT INTO order_items (id, order_id, product_id, product_name, quantity, unit_price, total, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [itemId, orderId, line.productId, line.productName, line.quantity, line.unitPrice, lineTotal, line.metadata || '{}']
+    );
+    const subtotal = Math.round((parseMoney(order.subtotal) + lineTotal) * 100) / 100;
+    await client.query(
+      'UPDATE orders SET subtotal = $1, total = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND business_id = $3',
+      [subtotal, orderId, businessId]
+    );
+    await client.query('COMMIT');
+    return { itemId, lineTotal };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * COMMERCIAL ACTIONS (Phase 13A)
+ *
+ * The AI may only propose; execution/status is server-controlled. A request
+ * body can never set status — it is always created 'proposed' here.
+ */
+export async function createCommercialAction({ businessId, conversationId = null, actionType, leadId = null, productId = null, orderId = null, customer = null, metadata = null }) {
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO commercial_actions (id, business_id, conversation_id, action_type, status, lead_id, product_id, order_id, customer, metadata)
+     VALUES ($1, $2, $3, $4, 'proposed', $5, $6, $7, $8, $9)`,
+    [id, businessId, conversationId || null, actionType, leadId || null, productId || null, orderId || null,
+      customer && typeof customer === 'object' ? JSON.stringify(customer) : '{}',
+      metadata && typeof metadata === 'object' ? JSON.stringify(metadata) : '{}']
+  );
+  return getCommercialAction(businessId, id);
+}
+
+export async function getCommercialAction(businessId, id) {
+  const res = await pool.query(
+    `SELECT id, business_id, conversation_id, action_type, status, lead_id, product_id, order_id,
+            customer, metadata, created_at, updated_at
+     FROM commercial_actions WHERE id = $1 AND business_id = $2`,
+    [id, businessId]
+  );
+  return res.rows[0] || null;
+}
+
+export async function listCommercialActions(businessId, { status = null } = {}) {
+  let sql = 'SELECT id, business_id, conversation_id, action_type, status, lead_id, product_id, order_id, customer, metadata, created_at, updated_at FROM commercial_actions WHERE business_id = $1';
+  const params = [businessId];
+  if (status) {
+    params.push(status);
+    sql += ` AND status = $${params.length}`;
+  }
+  sql += ' ORDER BY created_at DESC';
+  const res = await pool.query(sql, params);
+  return res.rows;
+}
+
+/**
+ * Compare-and-set commercial-action status transition. Only the server invokes
+ * this after it has actually performed (or rejected) the underlying work.
+ */
+export async function setCommercialActionStatus(businessId, id, nextStatus, expectedStatus) {
+  const res = await pool.query(
+    `UPDATE commercial_actions SET status = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3 AND status = $4
+     RETURNING id`,
+    [nextStatus, id, businessId, expectedStatus]
+  );
+  return res.rows.length > 0;
+}
+
+export async function linkCommercialActionOrder(businessId, id, orderId) {
+  const res = await pool.query(
+    `UPDATE commercial_actions SET order_id = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3`,
+    [orderId, id, businessId]
+  );
+  return res.rowCount > 0;
+}
+
+/**
+ * CHANNEL IDENTITY + CONFIGURATION (Phase 13A)
+ */
+export async function getChannelIdentity(businessId, channel, externalId) {
+  const res = await pool.query(
+    `SELECT id, business_id, channel, external_id, conversation_id, created_at, updated_at
+     FROM channel_identities WHERE business_id = $1 AND channel = $2 AND external_id = $3`,
+    [businessId, channel, externalId]
+  );
+  return res.rows[0] || null;
+}
+
+export async function createChannelIdentity({ businessId, channel, externalId, conversationId }) {
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO channel_identities (id, business_id, channel, external_id, conversation_id)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (business_id, channel, external_id) DO UPDATE SET conversation_id = EXCLUDED.conversation_id, updated_at = CURRENT_TIMESTAMP`,
+    [id, businessId, channel, externalId, conversationId]
+  );
+  return getChannelIdentity(businessId, channel, externalId);
+}
+
+export async function getChannelConfigForBusiness(businessId, channel) {
+  const res = await pool.query(
+    `SELECT id, business_id, channel, enabled, status, display_name, created_at, updated_at
+     FROM channel_config WHERE business_id = $1 AND channel = $2`,
+    [businessId, channel]
+  );
+  return res.rows[0] || null;
+}
+
+export async function upsertChannelConfig(businessId, channel, { enabled = null, status = null, displayName = null } = {}) {
+  const existing = await getChannelConfigForBusiness(businessId, channel);
+  const values = {
+    enabled: enabled === null || enabled === undefined ? (existing ? existing.enabled : false) : !!enabled,
+    status: status ?? (existing ? existing.status : 'not_configured'),
+    displayName: displayName ?? (existing ? existing.display_name : 'WhatsApp'),
+  };
+  await pool.query(
+    `INSERT INTO channel_config (id, business_id, channel, enabled, status, display_name)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (business_id, channel) DO UPDATE SET
+       enabled = EXCLUDED.enabled,
+       status = EXCLUDED.status,
+       display_name = EXCLUDED.display_name,
+       updated_at = CURRENT_TIMESTAMP`,
+    [crypto.randomUUID(), businessId, channel, values.enabled, values.status, values.displayName]
+  );
+  return getChannelConfigForBusiness(businessId, channel);
+}
+
+export async function listChannelConfigs(businessId) {
+  const res = await pool.query(
+    `SELECT id, business_id, channel, enabled, status, display_name, created_at, updated_at
+     FROM channel_config WHERE business_id = $1 ORDER BY channel`,
+    [businessId]
+  );
+  return res.rows;
+}
+
+export async function findDefaultAgent(businessId) {
+  const res = await pool.query(
+    `SELECT id, name, status FROM agents WHERE business_id = $1 AND status = 'Active' ORDER BY created_at ASC LIMIT 1`,
+    [businessId]
+  );
+  return res.rows[0] || null;
 }

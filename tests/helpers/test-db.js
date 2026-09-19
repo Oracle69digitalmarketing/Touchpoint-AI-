@@ -33,8 +33,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEST_SCHEMA = 'touchpoint_test';
 const TEST_SEARCH_PATH_OPTION = `-c search_path=${TEST_SCHEMA}`;
 
-const TEST_DATABASE_URL =
-  process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/touchpoint_test';
+const DATABASE_URL_REQUIRED =
+  'DATABASE_URL is required to run the tests: supply the hosted isolated "touchpoint_test" database connection; refusing to fall back to a local PostgreSQL instance.';
+const { DATABASE_URL } = process.env;
+if (!DATABASE_URL) throw new Error(DATABASE_URL_REQUIRED);
+const TEST_DATABASE_URL = DATABASE_URL;
 
 const SCHEMA_PATH = path.join(__dirname, '..', '..', 'schema-pg.sql');
 
@@ -42,6 +45,11 @@ const TABLES_TO_TRUNCATE = [
   'password_reset_tokens',
   'lead_notifications',
   'funnel_events',
+  'order_items',
+  'orders',
+  'commercial_actions',
+  'channel_identities',
+  'channel_config',
   'leads',
   'conversation_messages',
   'conversations',
