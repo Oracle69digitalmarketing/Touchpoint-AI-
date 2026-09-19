@@ -48,7 +48,26 @@ if (!fs.existsSync(tHtmlPath)) {
   );
 }
 
-const { default: app, _setGroqClient } = await import(path.join(__dirname, '..', 'server.js'));
+const { default: app, _setGroqClient, _setPaystackHttp } = await import(path.join(__dirname, '..', 'server.js'));
+
+// Phase 13B: the payment-init path lives behind the provider HTTP seam. The
+// fake transport returns an authoritative checkout without any network call;
+// production always uses the real Paystack API.
+_setPaystackHttp({
+  async initialize({ reference, amount, email, currency }) {
+    return {
+      status: true,
+      data: {
+        reference,
+        access_code: `acc_${reference}`,
+        authorization_url: `https://checkout.paystack.com/${reference}`,
+      },
+    };
+  },
+  async verify() {
+    throw new Error('verify is not used by the Phase 13A suite');
+  },
+});
 
 const capturedSystemPrompts = [];
 let fakeExtraction = { name: null, phone: null, email: null, intent: null, qualificationScore: 0 };
@@ -238,11 +257,16 @@ test('5. order lifecycle: draft -> pending_payment, then items are locked; pendi
   const created = (await createOrder(businessA.token, { items: [{ productId: productA.id, quantity: 1 }] })).body.order;
   assert.equal(created.status, 'draft');
 
-  // start-payment: draft -> pending_payment (payment becomes 'pending', never 'paid')
-  const started = await request(`/v1/orders/${created.id}/start-payment`, { method: 'POST', token: businessA.token });
-  assert.equal(started.status, 200);
+  // start-payment was superseded in 13B by POST /v1/orders/:id/payment: it
+  // creates the live payment intent and moves draft -> pending_payment
+  // (payment becomes 'pending', never 'paid').
+  const started = await request(`/v1/orders/${created.id}/payment`, { method: 'POST', token: businessA.token });
+  assert.equal(started.status, 201);
   assert.equal(started.body.order.status, 'pending_payment');
   assert.equal(started.body.order.paymentStatus, 'pending');
+  assert.equal(started.body.intent.status, 'pending');
+  assert.equal(started.body.intent.amountMinor, 850); // 8.5 NGN -> integer kobo
+  assert.ok(started.body.intent.checkout.authorizationUrl);
 
   // items are only addable while draft
   const addItem = await request(`/v1/orders/${created.id}/items`, {
@@ -259,7 +283,7 @@ test('5. order lifecycle: draft -> pending_payment, then items are locked; pendi
   assert.equal(cancelled.body.order.paymentStatus, 'pending');
 });
 
-test('6. invalid transitions are rejected (cancel->cancel, cancelled->start-payment)', async () => {
+test('6. invalid transitions are rejected (cancel->cancel, cancelled->payment)', async () => {
   const created = (await createOrder(businessA.token, { items: [{ productId: productA.id, quantity: 1 }] })).body.order;
   const cancelled = await request(`/v1/orders/${created.id}/cancel`, { method: 'POST', token: businessA.token });
   assert.equal(cancelled.status, 200);
@@ -268,7 +292,7 @@ test('6. invalid transitions are rejected (cancel->cancel, cancelled->start-paym
   assert.equal(doubleCancel.status, 409);
   assert.equal(doubleCancel.body.code, 'INVALID_TRANSITION');
 
-  const payAfterCancel = await request(`/v1/orders/${created.id}/start-payment`, { method: 'POST', token: businessA.token });
+  const payAfterCancel = await request(`/v1/orders/${created.id}/payment`, { method: 'POST', token: businessA.token });
   assert.equal(payAfterCancel.status, 409);
 
   // missing order -> 404

@@ -120,6 +120,8 @@ import {
   listOrdersByConversation,
   setOrderStatus,
   setOrderPaymentStatus,
+  listPaymentIntentsByOrder,
+  voidPendingPaymentIntents,
   addOrderItemRecord,
   createCommercialAction,
   getCommercialAction,
@@ -135,6 +137,14 @@ import {
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
 import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendChannelMessage } from './channel-adapter.js';
+import { initializeOrderPayment, handleProviderWebhook } from './payment-service.js';
+import { _setPaystackHttp as setPaymentProviderHttp } from './payment-provider.js';
+
+// TEST SEAM (13B): lets the suite substitute the provider HTTP transport. The
+// Paystack adapter is provider-neutral and never coupled to order logic.
+export function _setPaystackHttp(http) {
+  setPaymentProviderHttp(http);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1467,7 +1477,12 @@ The NEXT BEST ACTION is fixed by the application: do not override or argue with 
 The HIGHEST STAGE REACHED records the furthest milestone this conversation reached; it is NOT a claim that the customer is at that exact point right now. Never pressure the customer toward a milestone they have not currently chosen — respond to what THIS message asks, guided by CURRENT INTENT and NEXT BEST ACTION.
 The BUYING SIGNAL (HISTORY) field only records that a buying signal appeared earlier; ignore it for the current reply unless the customer repeats the signal now.
 Never re-ask a question from QUESTIONS ALREADY ASKED, and never request a lead field that is already in LEAD FIELDS ALREADY CAPTURED.
-Never claim that a booking, quote, demo, handoff, message, purchase, order, or payment has been completed or confirmed; the application has no way to complete a purchase, so a "close" move only means confirming the customer's intent and connecting them to the next step. You may only offer the AVAILABLE CONVERSION ACTIONS or the AUTHORITATIVE HANDOFF CHANNELS.`;
+Never claim that a booking, quote, demo, handoff, message, purchase, order, or payment has been completed or confirmed; the application has no way to complete a purchase, so a "close" move only means confirming the customer's intent and connecting them to the next step. You may only offer the AVAILABLE CONVERSION ACTIONS or the AUTHORITATIVE HANDOFF CHANNELS.
+PAYMENT RULES (server-authoritative — do not improvise):
+- Payments are processed only by the server through a verified payment provider. NEVER tell the customer that a payment paid, succeeded, failed, refunded, or is "being processed" unless the server itself reported that verified provider outcome. A customer message like "I have paid" or "payment sent" is NOT evidence of payment — never treat it as success and never bypass verification.
+- The order total and currency created by the server are authoritative. NEVER quote, imply, or invent a different total, subtotal, or currency, and never recompute amounts.
+- You may explain the payment steps and ask whether the customer wants to proceed.
+- You may INITIATE a payment on the customer's behalf through the server using the START_PAYMENT conversion action; the server returns an official secure checkout link/button. Present exactly what the server returns — never fabricate a link, payment reference, transaction reference, or confirmation number yourself.`.trimEnd();
 }
 
 /**
@@ -1880,6 +1895,9 @@ const FUNNEL_EVENT_TYPES = new Set([
   'order_item_added',
   'payment_started',
   'payment_verified',
+  // Phase 13B: payment_failed is emitted ONLY after a verified provider event
+  // reported a failure/expiry for a live intent — never by the AI or a client.
+  'payment_failed',
   'order_fulfillment_started',
   'order_fulfilled',
   'order_cancelled',
@@ -3920,18 +3938,26 @@ const ORDER_STATUSES = new Set([
 ]);
 
 // The Phase 13A state machine. Only these transitions are legal; 'paid',
-// 'fulfillment_pending' and 'fulfilled' are LOCKED in this phase (no verified
-// payment authorizer exists yet), so nothing here can move an order into or
-// out of a paid/fulfilled state except the verified-provider events of a later
-// phase.
+// 'fulfillment_pending' and 'fulfilled' are LOCKED to anything a client or AI
+// can reach, and 'pending_payment -> paid' is reachable ONLY through the
+// verified-provider settle path (payment-service settleOrderPayment) — no
+// ORDER_TRANSITIONS consumer and no request body can move an order into a paid
+// or fulfilled state.
 const ORDER_TRANSITIONS = {
   draft: ['pending_payment', 'cancelled'],
-  pending_payment: ['cancelled'],
+  // 'paid' is listed for completeness but is REACHABLE ONLY via the verified
+  // provider settle transaction (payment-service/db-pg); no consumer of this
+  // map and no request body can invoke it.
+  pending_payment: ['cancelled', 'paid'],
   paid: [],
   fulfillment_pending: [],
   fulfilled: [],
   cancelled: [],
 };
+
+// Payment state is server-controlled free text (a request can never set it);
+// these are the exact values payment-service ever writes.
+const ORDER_PAYMENT_STATUSES = new Set(['unpaid', 'pending', 'failed', 'expired', 'paid']);
 
 const cleanMoney = (value) => {
   const n = Number(value);
@@ -4002,6 +4028,22 @@ const publicOrder = (order) => ({
   })) : undefined,
   createdAt: order.created_at,
   updatedAt: order.updated_at,
+});
+
+const publicIntent = (intent) => ({
+  id: intent.id,
+  orderId: intent.order_id,
+  provider: intent.provider,
+  status: intent.status,
+  providerReference: intent.provider_reference,
+  amountMinor: intent.expected_amount_minor,
+  currency: intent.currency,
+  checkout: intent.checkout_metadata || {},
+  failureReason: intent.failure_reason || null,
+  paidAmountMinor: intent.paid_amount_minor != null ? intent.paid_amount_minor : null,
+  verifiedAt: intent.verified_at || null,
+  createdAt: intent.created_at,
+  updatedAt: intent.updated_at,
 });
 
 const publicCommercialAction = (a) => ({
@@ -4093,28 +4135,154 @@ app.get('/v1/orders/:id', requireAuth, asyncHandler(async (req, res) => {
   res.status(200).json({ order: publicOrder(order) });
 }));
 
-// Start payment on a draft order. Only a draft may enter pending_payment, and
-// even then payment_status is only ever set to 'pending' here: 'paid' can only
-// arrive via a verified payment-provider event in a later phase.
-app.post('/v1/orders/:id/start-payment', requireAuth, asyncHandler(async (req, res) => {
-  const order = await getOrderById(req.business.id, req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.items.length === 0) return res.status(409).json({ error: 'Order has no items', code: 'ORDER_EMPTY' });
-  if (!ORDER_TRANSITIONS[order.status] || !ORDER_TRANSITIONS[order.status].includes('pending_payment')) {
-    return res.status(409).json({ error: `Order cannot transition ${order.status} -> pending_payment`, code: 'INVALID_TRANSITION' });
+// Initialize (or reuse) the live payment intent for an order — the ONLY way an
+// order enters pending_payment (Phase 13B). Money figures are server-derived:
+// the request can express provider choice / an optional Idempotency-Key / a
+// return URL, but never amounts, statuses or payment state. `paid` can only
+// arrive via a verified payment-provider webhook event.
+async function paymentInitHandler(req, res) {
+  const body = req.body || {};
+  const provider = typeof body.provider === 'string' && body.provider.trim()
+    ? body.provider.trim().toLowerCase()
+    : config.paymentProvider;
+
+  const idempotencyHeader = (req.get('Idempotency-Key') || '').trim();
+  let idempotencyKey = null;
+  if (idempotencyHeader) {
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyHeader)) {
+      return res.status(400).json({ error: 'Idempotency-Key must be 1-128 characters of [A-Za-z0-9._:-]' });
+    }
+    idempotencyKey = idempotencyHeader;
   }
-  const moved = await setOrderStatus(req.business.id, order.id, 'pending_payment', 'draft');
-  if (!moved) return res.status(409).json({ error: 'Order state changed while processing; retry', code: 'STALE_STATE' });
-  await setOrderPaymentStatus(req.business.id, order.id, 'pending');
+
+  const customer = body.customer && typeof body.customer === 'object' && !Array.isArray(body.customer)
+    ? {
+        name: cleanName(body.customer.name),
+        phone: cleanPhone(body.customer.phone),
+        email: cleanEmail(body.customer.email),
+      }
+    : {};
+
+  const returnUrl = typeof body.returnUrl === 'string' && body.returnUrl.trim() ? body.returnUrl.trim().slice(0, 1024) : null;
+
+  let result;
+  try {
+    result = await initializeOrderPayment(req.business.id, req.params.id, {
+      providerName: provider,
+      idempotencyKey,
+      returnUrl,
+      customer,
+    });
+  } catch (error) {
+    if (error.name === 'ProviderError') {
+      const status = error.status === 404 ? 400 : error.status;
+      return res.status(status).json({ error: error.message, code: 'PROVIDER_ERROR' });
+    }
+    throw error;
+  }
+
+  if (result.error) {
+    return res.status(result.error.status).json({ error: result.error.message, code: result.error.code });
+  }
+
   await recordFunnelEventOnce({
     businessId: req.business.id,
-    conversationId: order.conversation_id,
+    conversationId: result.order.conversation_id,
     eventType: 'payment_started',
-    key: `order:${order.id}:payment`,
-    meta: { orderId: order.id },
+    key: `order:${result.order.id}:payment`,
+    meta: { orderId: result.order.id, intentId: result.intent.id, provider },
   });
-  const fresh = await getOrderById(req.business.id, order.id);
-  res.status(200).json({ order: publicOrder(fresh) });
+
+  res.status(result.created ? 201 : 200).json({ intent: publicIntent(result.intent), order: publicOrder(result.order) });
+}
+
+app.post('/v1/orders/:id/payment', requireAuth, asyncHandler(paymentInitHandler));
+
+// Poll the server-authoritative payment state for an order. Read-only; never
+// triggers settlement by itself (a frontend "I've paid" poll is never evidence).
+app.get('/v1/orders/:id/payment', requireAuth, asyncHandler(async (req, res) => {
+  const order = await getOrderById(req.business.id, req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  const reference = typeof req.query.reference === 'string' && req.query.reference.trim()
+    ? req.query.reference.trim()
+    : null;
+  const intents = await listPaymentIntentsByOrder(req.business.id, order.id);
+  let intent = null;
+  if (reference) {
+    intent = intents.find((i) => i.provider_reference === reference) || null;
+  } else {
+    intent = intents.find((i) => i.status === 'pending') || intents[0] || null;
+  }
+  res.status(200).json({ intent: intent ? publicIntent(intent) : null, order: publicOrder(order) });
+}));
+
+/**
+ * Records the funnel events that may ONLY follow a verified provider
+ * settlement/failure. Dedup keys using the intent id guarantee each intent
+ * contributes at most one of each event (duplicate webhook deliveries already
+ * ack well before this point).
+ */
+async function emitPaymentOutcomeEvents(outcome) {
+  const { businessId, orderId, intentId } = outcome || {};
+  if (!businessId || !orderId || !intentId) return;
+  try {
+    const order = await getOrderById(businessId, orderId);
+    if (!order) return;
+    if (outcome.outcome === 'settled') {
+      await recordFunnelEventOnce({
+        businessId,
+        conversationId: order.conversation_id,
+        eventType: 'payment_verified',
+        key: `intent:${intentId}`,
+        meta: { orderId, intentId, provider: outcome.provider },
+      });
+    } else if (outcome.outcome === 'recorded' || outcome.outcome === 'amount_or_currency_mismatch') {
+      await recordFunnelEventOnce({
+        businessId,
+        conversationId: order.conversation_id,
+        eventType: 'payment_failed',
+        key: `intent:${intentId}`,
+        meta: { orderId, intentId, reason: outcome.reason || outcome.failureReason || null },
+      });
+    } else if (outcome.outcome === 'not_payable') {
+      // Reconciliation anomaly (spec §7.2): verified money for an order that is
+      // no longer payable. Log-only in 13B; a human reconciles from the ledger.
+      console.error('[Payment] Reconciliation anomaly: order not payable for a verified provider event',
+        JSON.stringify({ orderId, intentId, reason: outcome.outcome }));
+    }
+  } catch (error) {
+    console.error('[Payment] Funnel event emission failed:', error.message);
+  }
+}
+
+/**
+ * The ONLY unauthenticated place payment status can change, and only after
+ * HMAC signature verification. Idempotency comes from the webhook-event ledger
+ * (ON CONFLICT DO NOTHING); settlement from atomic compare-and-set. Unknown
+ * references ack 200 benevolently (no existence oracle).
+ */
+app.post('/v1/payments/webhook/:provider', asyncHandler(async (req, res) => {
+  try {
+    const result = await handleProviderWebhook({
+      providerName: req.params.provider,
+      rawBody: req.rawBody,
+      headers: req.headers,
+    });
+    if (result.outcome) {
+      await emitPaymentOutcomeEvents({ provider: req.params.provider, ...(result.outcome || {}) });
+    }
+  } catch (error) {
+    if (error.name === 'WebhookError') {
+      return res.status(error.status).json({ error: error.message });
+    }
+    if (error.name === 'ProviderError') {
+      // Unknown provider / registry failures must never leak internals.
+      const status = error.status === 404 ? 400 : (error.status >= 500 ? error.status : 502);
+      return res.status(status).json({ error: error.message });
+    }
+    throw error;
+  }
+  res.status(200).json({ received: true });
 }));
 
 // Cancel an order. Only draft or pending_payment orders may be cancelled in
@@ -4128,6 +4296,10 @@ app.post('/v1/orders/:id/cancel', requireAuth, asyncHandler(async (req, res) => 
   }
   const moved = await setOrderStatus(req.business.id, order.id, 'cancelled', order.status);
   if (!moved) return res.status(409).json({ error: 'Order state changed while processing; retry', code: 'STALE_STATE' });
+  // Phase 13B: void any live pending intent so a late provider event can never
+  // settle a cancelled order (the settle guard refuses anyway — this just stops
+  // a dangling checkout and keeps the ledger honest).
+  await voidPendingPaymentIntents(req.business.id, order.id);
   await recordFunnelEventOnce({
     businessId: req.business.id,
     conversationId: order.conversation_id,
@@ -4273,9 +4445,51 @@ app.post('/v1/commercial/actions/:id/execute', requireAuth, asyncHandler(async (
     return res.status(200).json({ action: publicCommercialAction(fresh) });
   }
 
+  if (action.action_type === 'START_PAYMENT') {
+    // Phase 13B executor: creates/reuses the order's live payment intent and
+    // returns the authoritative checkout. Executes only when a server-backed,
+    // owned, payable order exists; a failed provider init leaves the order in a
+    // clean draft state via payment-service, not "paid".
+    if (!action.order_id) {
+      return res.status(409).json({ error: 'No server-backed order exists to charge.', code: 'ACTION_NOT_EXECUTABLE' });
+    }
+    let initResult;
+    try {
+      initResult = await initializeOrderPayment(req.business.id, action.order_id, {
+        providerName: config.paymentProvider,
+      });
+    } catch (error) {
+      if (error.name === 'ProviderError') {
+        return res.status(error.status === 404 ? 400 : error.status).json({ error: error.message, code: 'PROVIDER_ERROR' });
+      }
+      throw error;
+    }
+    if (initResult.error) {
+      const code = initResult.error.code === 'NOT_FOUND' || initResult.error.code === 'INVALID_TRANSITION'
+        ? 'ACTION_NOT_EXECUTABLE'
+        : initResult.error.code;
+      return res.status(409).json({ error: initResult.error.message, code });
+    }
+    const moved = await setCommercialActionStatus(req.business.id, action.id, 'executed', 'proposed');
+    if (!moved) return res.status(409).json({ error: 'Action state changed while processing; retry', code: 'STALE_STATE' });
+    await linkCommercialActionOrder(req.business.id, action.id, action.order_id);
+    await recordFunnelEventOnce({
+      businessId: req.business.id,
+      conversationId: action.conversation_id,
+      eventType: 'payment_started',
+      key: `order:${action.order_id}:payment`,
+      meta: { orderId: action.order_id, intentId: initResult.intent.id, provider: initResult.intent.provider },
+    });
+    const fresh = await getCommercialAction(req.business.id, action.id);
+    return res.status(200).json({
+      action: publicCommercialAction(fresh),
+      intent: publicIntent(initResult.intent),
+      checkout: initResult.intent.checkout_metadata || {},
+    });
+  }
+
   if (action.action_type === 'REQUEST_QUOTE' || action.action_type === 'BOOK'
-    || action.action_type === 'REQUEST_DEMO' || action.action_type === 'TALK_TO_HUMAN'
-    || action.action_type === 'START_PAYMENT') {
+    || action.action_type === 'REQUEST_DEMO' || action.action_type === 'TALK_TO_HUMAN') {
     return res.status(409).json({ error: 'This action type has no server-side executor yet in Phase 13A.', code: 'ACTION_NOT_EXECUTABLE' });
   }
 

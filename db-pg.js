@@ -1466,3 +1466,237 @@ export async function findDefaultAgent(businessId) {
   );
   return res.rows[0] || null;
 }
+
+/**
+ * PAYMENT INTENTS (Phase 13B)
+ *
+ * The provider-neutral intent ledger. Every order can have at most one live
+ * `pending` intent at a time (partial unique index on order_id), and a provider
+ * reference maps to exactly one intent, so a provider transaction can settle
+ * one and only one order. All money at this boundary is integer minor units;
+ * the decimal order total is converted once upstream.
+ */
+const PAYMENT_INTENT_COLUMNS = `
+  pi.id, pi.business_id, pi.order_id, pi.provider, pi.status,
+  pi.provider_reference, pi.expected_amount_minor, pi.currency,
+  pi.idempotency_key, pi.checkout_metadata, pi.metadata, pi.failure_reason,
+  pi.paid_amount_minor, pi.provider_event_id, pi.verified_at,
+  pi.created_at, pi.updated_at
+`;
+
+const mapPaymentIntent = (row) =>
+  row
+    ? {
+        ...row,
+        expected_amount_minor: row.expected_amount_minor != null ? Number(row.expected_amount_minor) : null,
+        paid_amount_minor: row.paid_amount_minor != null ? Number(row.paid_amount_minor) : null,
+        checkout_metadata: row.checkout_metadata || {},
+        metadata: row.metadata || {},
+      }
+    : null;
+
+export async function createPaymentIntent({
+  businessId,
+  orderId,
+  provider,
+  providerReference,
+  expectedAmountMinor,
+  currency,
+  idempotencyKey = null,
+  metadata = null,
+}) {
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO payment_intents
+       (id, business_id, order_id, provider, status, provider_reference,
+        expected_amount_minor, currency, idempotency_key, checkout_metadata, metadata)
+     VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, '{}', $9)`,
+    [id, businessId, orderId, provider, providerReference, expectedAmountMinor, currency,
+      idempotencyKey || null,
+      metadata && typeof metadata === 'object' ? JSON.stringify(metadata) : '{}']
+  );
+  return getPaymentIntentById(businessId, id);
+}
+
+export async function getPaymentIntentById(businessId, id) {
+  const res = await pool.query(
+    `SELECT ${PAYMENT_INTENT_COLUMNS} FROM payment_intents pi WHERE pi.id = $1 AND pi.business_id = $2`,
+    [id, businessId]
+  );
+  return mapPaymentIntent(res.rows[0] || null);
+}
+
+/** Provider-scoped lookup for webhook settlement. Intentionally NOT business-scoped. */
+export async function getPaymentIntentByReference(provider, providerReference) {
+  const res = await pool.query(
+    `SELECT ${PAYMENT_INTENT_COLUMNS} FROM payment_intents pi
+     WHERE pi.provider = $1 AND pi.provider_reference = $2`,
+    [provider, providerReference]
+  );
+  return mapPaymentIntent(res.rows[0] || null);
+}
+
+export async function listPaymentIntentsByOrder(businessId, orderId) {
+  const res = await pool.query(
+    `SELECT ${PAYMENT_INTENT_COLUMNS} FROM payment_intents pi
+     WHERE pi.business_id = $1 AND pi.order_id = $2
+     ORDER BY pi.created_at DESC`,
+    [businessId, orderId]
+  );
+  return res.rows.map(mapPaymentIntent);
+}
+
+/** Compare-and-set intent status transition (only server code invokes this). */
+export async function setPaymentIntentStatus(businessId, id, nextStatus, expectedStatus, { failureReason = null } = {}) {
+  const res = await pool.query(
+    `UPDATE payment_intents SET status = $1,
+       failure_reason = $2,
+       updated_at = CURRENT_TIMESTAMP
+     WHERE id = $3 AND business_id = $4 AND status = $5
+     RETURNING id`,
+    [nextStatus, failureReason, id, businessId, expectedStatus]
+  );
+  return res.rows.length > 0;
+}
+
+/** Persist the provider checkout URL returned at initialization time. */
+export async function setPaymentIntentCheckout(businessId, id, checkout) {
+  await pool.query(
+    `UPDATE payment_intents SET checkout_metadata = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND business_id = $3`,
+    [JSON.stringify(checkout || {}), id, businessId]
+  );
+}
+
+/**
+ * Voids every live pending intent for an order (used when the order is
+ * cancelled). A cancelled order can never settle anyway (settleOrderPayment
+ * refuses), but voiding avoids leaving a dangling checkout the customer could
+ * still try to complete.
+ */
+export async function voidPendingPaymentIntents(businessId, orderId, reason = 'order_cancelled') {
+  await pool.query(
+    `UPDATE payment_intents SET status = 'void', failure_reason = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE order_id = $2 AND business_id = $3 AND status = 'pending'`,
+    [reason, orderId, businessId]
+  );
+}
+
+/**
+ * The single atomic settlement transition. Locks the order and the intent, and
+ * moves both only when: the order is `pending_payment` and not yet paid, and
+ * the intent is the order's own row still `pending`. Under row locks this
+ * serializes concurrent webhooks AND concurrent init-failure rollbacks, so a
+ * reference can settle at most once and only its exact order.
+ */
+export async function settleOrderPayment({ businessId, orderId, intentId, providerEventId = null, paidAmountMinor }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderRes = await client.query(
+      `SELECT status, conversation_id FROM orders WHERE id = $1 AND business_id = $2 FOR UPDATE`,
+      [orderId, businessId]
+    );
+    const order = orderRes.rows[0];
+    if (!order) throw new Error('Order not found for settlement');
+    if (order.status === 'paid') {
+      await client.query('ROLLBACK');
+      return { outcome: 'already_paid', orderId };
+    }
+    if (order.status !== 'pending_payment') {
+      await client.query('ROLLBACK');
+      return { outcome: 'not_payable', orderStatus: order.status, orderId };
+    }
+
+    const intentRes = await client.query(
+      `SELECT status FROM payment_intents
+       WHERE id = $1 AND order_id = $2 AND business_id = $3 FOR UPDATE`,
+      [intentId, orderId, businessId]
+    );
+    const intent = intentRes.rows[0];
+    if (!intent) throw new Error('Intent not found for settlement');
+    if (intent.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return { outcome: 'intent_already_processed', intentStatus: intent.status };
+    }
+
+    await client.query(
+      `UPDATE payment_intents
+       SET status = 'succeeded', paid_amount_minor = $1, provider_event_id = $2, failure_reason = NULL,
+           verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [paidAmountMinor, providerEventId, intentId]
+    );
+    await client.query(
+      `UPDATE orders SET status = 'paid', payment_status = 'paid', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND business_id = $2`,
+      [orderId, businessId]
+    );
+    await client.query('COMMIT');
+    return { outcome: 'settled', orderId, intentId };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Records a provider-reported failure/expiry against a live pending intent and
+ * mirrors the last observed attempt onto order.payment_status. The ORDER itself
+ * stays `pending_payment` (retryable); only the intent goes terminal.
+ */
+export async function recordIntentFailure({ businessId, orderId, intentId, intentStatus, failureReason, orderPaymentStatus }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderRes = await client.query(
+      `SELECT status FROM orders WHERE id = $1 AND business_id = $2 FOR UPDATE`,
+      [orderId, businessId]
+    );
+    const order = orderRes.rows[0];
+    if (!order) {
+      await client.query('ROLLBACK');
+      return { outcome: 'not_found' };
+    }
+    if (order.status === 'paid') {
+      await client.query('ROLLBACK');
+      return { outcome: 'already_paid' };
+    }
+    const intentRes = await client.query(
+      `SELECT status FROM payment_intents
+       WHERE id = $1 AND order_id = $2 AND business_id = $3 FOR UPDATE`,
+      [intentId, orderId, businessId]
+    );
+    const intent = intentRes.rows[0];
+    if (!intent) {
+      await client.query('ROLLBACK');
+      return { outcome: 'not_found' };
+    }
+    if (intent.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return { outcome: 'already_processed' };
+    }
+    await client.query(
+      `UPDATE payment_intents SET status = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [intentStatus, failureReason, intentId]
+    );
+    await client.query(
+      `UPDATE orders SET payment_status = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND business_id = $3`,
+      [orderPaymentStatus, orderId, businessId]
+    );
+    await client.query('COMMIT');
+    return {
+      outcome: 'recorded',
+      meta: { intentId, intentStatus, failureReason, orderPaymentStatus },
+    };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}

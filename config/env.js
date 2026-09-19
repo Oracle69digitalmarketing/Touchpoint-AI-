@@ -39,6 +39,7 @@ const NORMALIZED_ENV_KEYS = [
   'DATABASE_URL',
   'DATA_DIR',
   'TRUST_PROXY',
+  'PAYMENT_PROVIDER',
   'RESEND_API_KEY',
   'EMAIL_FROM',
 ];
@@ -192,6 +193,7 @@ export function loadConfig(rawEnv = process.env) {
       .filter(Boolean),
     databaseUrl: env.DATABASE_URL,
     trustProxy: env.TRUST_PROXY,
+    paymentProvider: env.PAYMENT_PROVIDER || 'paystack',
   };
 }
 

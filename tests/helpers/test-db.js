@@ -45,6 +45,7 @@ const TABLES_TO_TRUNCATE = [
   'password_reset_tokens',
   'lead_notifications',
   'funnel_events',
+  'payment_intents',
   'order_items',
   'orders',
   'commercial_actions',

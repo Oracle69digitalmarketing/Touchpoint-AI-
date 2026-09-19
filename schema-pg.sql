@@ -254,6 +254,41 @@ CREATE TABLE IF NOT EXISTS channel_config (
   UNIQUE (business_id, channel)
 );
 
+-- Payment intents (Phase 13B): the provider-neutral settlement ledger. At most
+-- one live 'pending' intent per order (partial unique index), and a provider
+-- reference maps to exactly one intent. All amounts here are exact integer
+-- minor units; the decimal order total is converted once upstream. Only a
+-- verified provider event can move an intent to 'succeeded' and thereby settle
+-- its exact order (settleOrderPayment in db-pg enforces both atomically).
+CREATE TABLE IF NOT EXISTS payment_intents (
+  id                     TEXT PRIMARY KEY,
+  business_id            TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  order_id               TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  provider               TEXT NOT NULL,
+  status                 TEXT NOT NULL DEFAULT 'pending',
+  provider_reference     TEXT NOT NULL,
+  expected_amount_minor  INTEGER NOT NULL CHECK (expected_amount_minor > 0),
+  currency               TEXT NOT NULL,
+  idempotency_key        TEXT,
+  checkout_metadata      JSONB NOT NULL DEFAULT '{}',
+  metadata               JSONB NOT NULL DEFAULT '{}',
+  failure_reason         TEXT,
+  paid_amount_minor      INTEGER,
+  provider_event_id      TEXT,
+  verified_at            TIMESTAMPTZ,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (provider, provider_reference)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_one_active_per_order
+  ON payment_intents(order_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_payment_intents_business ON payment_intents(business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_order ON payment_intents(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_provider_reference ON payment_intents(provider, provider_reference);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_idempotency
+  ON payment_intents(business_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 -- Observed conversion-funnel events (Batch 3). Append-only and tenant-scoped;
 -- event types are validated in the application before insert.
 CREATE TABLE IF NOT EXISTS funnel_events (
