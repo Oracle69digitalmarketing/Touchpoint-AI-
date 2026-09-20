@@ -688,7 +688,7 @@ export async function listConversations(businessId) {
 
 const PRODUCT_COLUMNS = `
   id, business_id, name, description, category, price, currency, status,
-  metadata, created_at, updated_at
+  bookable, metadata, created_at, updated_at
 `;
 
 const parsePrice = (value) => {
@@ -748,6 +748,7 @@ export async function updateProduct(businessId, id, data) {
     price: data.price,
     currency: data.currency,
     status: data.status,
+    bookable: data.bookable === undefined ? undefined : !!data.bookable,
     metadata: data.metadata && typeof data.metadata === 'object'
       ? JSON.stringify(data.metadata)
       : undefined,
@@ -1699,4 +1700,396 @@ export async function recordIntentFailure({ businessId, orderId, intentId, inten
   } finally {
     client.release();
   }
+}
+
+/**
+ * BOOKING STORAGE (Phase 13C)
+ *
+ * Reservations and transitions are the SERVER's job. Every mutating booking
+ * operation is transactional and fielding an advisory lock on the exact slot
+ * (business:product:start), so concurrent reservation/reschedule of the same
+ * slot serializes and the capacity check stays exact — the occupied interval
+ * is [requested_start_at, end_at) including buffer padding (correction E).
+ */
+
+export class BookingConflictError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'BookingConflictError';
+    this.code = code;
+  }
+}
+
+const BOOKING_COLUMNS = `
+  b.id, b.business_id, b.product_id, b.conversation_id, b.lead_id, b.order_id,
+  b.customer, b.name, b.phone, b.email, b.timezone, b.duration_minutes,
+  b.requested_start_at, b.end_at, b.status, b.idempotency_key, b.config_version,
+  b.hold_until, b.metadata, b.created_at, b.updated_at,
+  p.name AS product_name
+`;
+
+const BOOKING_CONFIG_COLUMNS = `
+  bc.id, bc.business_id, bc.product_id, bc.timezone, bc.slot_duration_minutes,
+  bc.buffer_minutes, bc.capacity, bc.operating_hours, bc.blackout_dates,
+  bc.min_advance_hours, bc.max_advance_days, bc.auto_confirm, bc.hold_minutes,
+  bc.allow_reschedule, bc.requires_payment, bc.config_version,
+  bc.created_at, bc.updated_at, p.name AS product_name, p.bookable AS product_bookable
+`;
+
+function bookingRow(row) {
+  return {
+    ...row,
+    duration_minutes: Number(row.duration_minutes),
+    config_version: Number(row.config_version),
+  };
+}
+
+function bookingConfigRow(row) {
+  return {
+    ...row,
+    slot_duration_minutes: Number(row.slot_duration_minutes),
+    buffer_minutes: Number(row.buffer_minutes),
+    capacity: Number(row.capacity),
+    min_advance_hours: Number(row.min_advance_hours),
+    max_advance_days: Number(row.max_advance_days),
+    hold_minutes: Number(row.hold_minutes),
+    config_version: Number(row.config_version),
+  };
+}
+
+/**
+ * Fetches the booking policy for a bookable product, tenant-scoped.
+ */
+export async function getBookingConfig(businessId, productId) {
+  const res = await pool.query(
+    `SELECT ${BOOKING_CONFIG_COLUMNS} FROM booking_configs bc
+     JOIN products p ON p.id = bc.product_id
+     WHERE bc.business_id = $1 AND bc.product_id = $2`,
+    [businessId, productId]
+  );
+  return res.rows[0] ? bookingConfigRow(res.rows[0]) : null;
+}
+
+export async function listBookingConfigs(businessId) {
+  const res = await pool.query(
+    `SELECT ${BOOKING_CONFIG_COLUMNS} FROM booking_configs bc
+     JOIN products p ON p.id = bc.product_id
+     WHERE bc.business_id = $1 ORDER BY bc.created_at ASC`,
+    [businessId]
+  );
+  return res.rows.map(bookingConfigRow);
+}
+
+/**
+ * Creates or replaces the booking policy for a product. Every successful
+ * update bumps config_version, which invalidates previously issued slot tokens
+ * (the server maps that to STALE_SLOT) — availability-affecting or not, an
+ * edit always re-pins the schedule the tokens describe.
+ */
+export async function putBookingConfig(businessId, productId, value) {
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO booking_configs (
+      id, business_id, product_id, timezone, slot_duration_minutes, buffer_minutes,
+      capacity, operating_hours, blackout_dates, min_advance_hours, max_advance_days,
+      auto_confirm, hold_minutes, allow_reschedule, requires_payment, config_version
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 1)
+    ON CONFLICT (product_id) DO UPDATE SET
+      timezone = EXCLUDED.timezone,
+      slot_duration_minutes = EXCLUDED.slot_duration_minutes,
+      buffer_minutes = EXCLUDED.buffer_minutes,
+      capacity = EXCLUDED.capacity,
+      operating_hours = EXCLUDED.operating_hours,
+      blackout_dates = EXCLUDED.blackout_dates,
+      min_advance_hours = EXCLUDED.min_advance_hours,
+      max_advance_days = EXCLUDED.max_advance_days,
+      auto_confirm = EXCLUDED.auto_confirm,
+      hold_minutes = EXCLUDED.hold_minutes,
+      allow_reschedule = EXCLUDED.allow_reschedule,
+      requires_payment = EXCLUDED.requires_payment,
+      config_version = booking_configs.config_version + 1,
+      updated_at = CURRENT_TIMESTAMP`,
+    [
+      id, businessId, productId, value.timezone, value.slot_duration_minutes,
+      value.buffer_minutes, value.capacity,
+      JSON.stringify(value.operating_hours), JSON.stringify(value.blackout_dates),
+      value.min_advance_hours, value.max_advance_days, value.auto_confirm,
+      value.hold_minutes, value.allow_reschedule, value.requires_payment,
+    ]
+  );
+  return getBookingConfig(businessId, productId);
+}
+
+export async function deleteBookingConfig(businessId, productId) {
+  const res = await pool.query(
+    'DELETE FROM booking_configs WHERE business_id = $1 AND product_id = $2',
+    [businessId, productId]
+  );
+  return res.rowCount > 0;
+}
+
+/**
+ * Counts occupying (reserved/confirmed) bookings overlapping [start, end).
+ */
+async function countSlotOverlap(client, { businessId, productId, start, end, excludeBookingId = null, lockKey }) {
+  if (lockKey) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [lockKey]);
+  }
+  const params = [businessId, productId, start.toISOString(), end.toISOString()];
+  let sql = `
+    SELECT COUNT(*) AS n FROM bookings
+    WHERE business_id = $1 AND product_id = $2
+      AND status IN ('reserved', 'confirmed')
+      AND requested_start_at < $4 AND end_at > $3`;
+  if (excludeBookingId) {
+    params.push(excludeBookingId);
+    sql += ` AND id <> $${params.length}`;
+  }
+  const res = await client.query(sql, params);
+  return parseInt(res.rows[0].n, 10);
+}
+
+export async function getBooking(businessId, id) {
+  const res = await pool.query(
+    `SELECT ${BOOKING_COLUMNS} FROM bookings b
+     JOIN products p ON p.id = b.product_id
+     WHERE b.business_id = $1 AND b.id = $2`,
+    [businessId, id]
+  );
+  return res.rows[0] ? bookingRow(res.rows[0]) : null;
+}
+
+export async function listBookings(businessId, { status = null, productId = null, from = null, to = null } = {}) {
+  const params = [businessId];
+  let sql = `SELECT ${BOOKING_COLUMNS} FROM bookings b JOIN products p ON p.id = b.product_id WHERE b.business_id = $1`;
+  if (status) {
+    params.push(status);
+    sql += ` AND b.status = $${params.length}`;
+  }
+  if (productId) {
+    params.push(productId);
+    sql += ` AND b.product_id = $${params.length}`;
+  }
+  if (from) {
+    params.push(from.toISOString());
+    sql += ` AND b.requested_start_at >= $${params.length}`;
+  }
+  if (to) {
+    params.push(to.toISOString());
+    sql += ` AND b.requested_start_at < $${params.length}`;
+  }
+  sql += ' ORDER BY b.requested_start_at ASC LIMIT 200';
+  const res = await pool.query(sql, params);
+  return res.rows.map(bookingRow);
+}
+
+/**
+ * Transactional reservation. Advisory-locked on the exact slot, then an exact
+ * capacity count (occupied interval including buffers) before insert, then an
+ * idempotent insert (retried requests with the same business+idempotency_key
+ * return the existing booking with `duplicate: true`). Status is decided by the
+ * server policy: confirmed when auto_confirm and no required payment, otherwise
+ * reserved with a hold_until window.
+ *
+ * Throws BookingConflictError('SLOT_NOT_AVAILABLE') when the slot is full.
+ */
+export async function reserveBooking({
+  businessId, productId, conversationId = null, leadId = null,
+  slot, config, customer = {}, name = null, phone = null, email = null,
+  idempotencyKey = null, now = new Date(),
+}) {
+  const startIso = slot.start.toISOString();
+  const lockKey = `${businessId}:${productId}:${startIso}`;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [lockKey]);
+
+    if (idempotencyKey) {
+      const existing = await client.query(
+        'SELECT id FROM bookings WHERE business_id = $1 AND idempotency_key = $2',
+        [businessId, idempotencyKey]
+      );
+      if (existing.rows.length > 0) {
+        await client.query('COMMIT');
+        const booking = await getBooking(businessId, existing.rows[0].id);
+        return { booking, duplicate: true };
+      }
+    }
+
+    const occupied = await countSlotOverlap(client, { businessId, productId, start: slot.start, end: slot.end });
+    if (occupied >= config.capacity) {
+      await client.query('ROLLBACK');
+      throw new BookingConflictError('SLOT_NOT_AVAILABLE', 'This slot is no longer available.');
+    }
+
+    const autoConfirmed = config.auto_confirm && !config.requires_payment;
+    const id = crypto.randomUUID();
+    const holdUntil = autoConfirmed
+      ? null
+      : new Date(now.getTime() + config.hold_minutes * 60000);
+    const insertRes = await client.query(
+      `INSERT INTO bookings (
+        id, business_id, product_id, conversation_id, lead_id, customer, name,
+        phone, email, timezone, duration_minutes, requested_start_at, end_at,
+        status, idempotency_key, config_version, hold_until, metadata
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, '{}')
+      RETURNING id`,
+      [
+        id, businessId, productId, conversationId, leadId,
+        JSON.stringify(customer), name, phone, email, config.timezone,
+        slot.durationMinutes, startIso, slot.end.toISOString(),
+        autoConfirmed ? 'confirmed' : 'reserved', idempotencyKey,
+        config.config_version, holdUntil,
+      ]
+    );
+    await client.query('COMMIT');
+    const booking = await getBooking(businessId, insertRes.rows[0].id);
+    return { booking, duplicate: false };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e instanceof BookingConflictError) throw e;
+    // Unique violation on (business_id, idempotency_key): a concurrent request
+    // with the same key won the insert; return its booking instead of failing.
+    if (e.code === '23505') {
+      const existing = await client.query(
+        'SELECT id FROM bookings WHERE business_id = $1 AND idempotency_key = $2',
+        [businessId, idempotencyKey]
+      );
+      if (existing.rows.length > 0) {
+        const booking = await getBooking(businessId, existing.rows[0].id);
+        return { booking, duplicate: true };
+      }
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Compare-and-set status transition. Only the server calls this, only with a
+ * legal `from` -> `to` pair, and only when the action actually happened. Any
+ * nonzero status change marks updated_at. Returns the refreshed booking or
+ * null when the CAS lost (STALE_STATE).
+ */
+export async function transitionBooking(businessId, id, { to, from, patch = null }) {
+  const params = [businessId, id, to, from];
+  let sql = `
+    UPDATE bookings SET status = $3, updated_at = CURRENT_TIMESTAMP,
+      hold_until = CASE WHEN $3 = 'confirmed' THEN NULL ELSE hold_until END`;
+  if (patch && typeof patch === 'object') {
+    params.push(JSON.stringify(patch));
+    sql += `, metadata = COALESCE(metadata, '{}'::jsonb) || $${params.length}::jsonb`;
+  }
+  sql += ` WHERE business_id = $1 AND id = $2 AND status = ANY($4)`;
+  const res = await pool.query(sql, params);
+  if (res.rowCount === 0) return null;
+  return getBooking(businessId, id);
+}
+
+/**
+ * Marks every reserved booking whose hold window has elapsed as expired.
+ * Returns the ids of bookings that were expired.
+ */
+export async function expireStaleBookings(businessId) {
+  const res = await pool.query(
+    `UPDATE bookings SET status = 'expired', updated_at = CURRENT_TIMESTAMP,
+       metadata = COALESCE(metadata, '{}'::jsonb) || '{"autoExpired": true}'::jsonb
+     WHERE business_id = $1 AND status = 'reserved' AND hold_until IS NOT NULL AND hold_until <= CURRENT_TIMESTAMP
+     RETURNING id`,
+    [businessId]
+  );
+  return res.rows.map((r) => r.id);
+}
+
+/**
+ * Atomic reschedule (correction C): locks the NEW slot, rechecks capacity over
+ * the complete occupied interval excluding this booking, and moves it in the
+ * same transaction. Returns { booking, moved } — moved is false when the
+ * booking was not in a rescheduleable status. Throws
+ * BookingConflictError('SLOT_NOT_AVAILABLE') when the destination is full.
+ */
+export async function rescheduleBooking({
+  businessId, bookingId, config, newSlot,
+  requireStatuses = ['reserved', 'confirmed'], now = new Date(),
+}) {
+  const lockKey = `${businessId}:${newSlot.start.toISOString()}`;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [lockKey]);
+
+    const cur = await client.query(
+      `SELECT id, status, requested_start_at, hold_until FROM bookings
+       WHERE business_id = $1 AND id = $2 FOR UPDATE`,
+      [businessId, bookingId]
+    );
+    if (cur.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return { booking: null, moved: false };
+    }
+    const current = cur.rows[0];
+    if (!requireStatuses.includes(current.status)) {
+      await client.query('ROLLBACK');
+      return { booking: null, moved: false };
+    }
+
+    const occupied = await countSlotOverlap(client, {
+      businessId, productId: newSlot.productId, start: newSlot.start, end: newSlot.end,
+      excludeBookingId: bookingId,
+    });
+    if (occupied >= config.capacity) {
+      await client.query('ROLLBACK');
+      throw new BookingConflictError('SLOT_NOT_AVAILABLE', 'This slot is no longer available.');
+    }
+
+    const patch = {
+      reschedule: [{
+        from: {
+          requestedStartAt: current.requested_start_at.toISOString(),
+          status: current.status,
+        },
+        to: {
+          requestedStartAt: newSlot.start.toISOString(),
+          endAt: newSlot.end.toISOString(),
+          configVersion: config.config_version,
+        },
+      }],
+    };
+    const holdUntil = current.status === 'reserved'
+      ? new Date(now.getTime() + config.hold_minutes * 60000)
+      : null;
+    await client.query(
+      `UPDATE bookings SET requested_start_at = $1, end_at = $2,
+         config_version = $3, hold_until = $4, updated_at = CURRENT_TIMESTAMP,
+         metadata = COALESCE(metadata, '{}'::jsonb) || $5::jsonb
+       WHERE business_id = $6 AND id = $7`,
+      [
+        newSlot.start.toISOString(), newSlot.end.toISOString(),
+        config.config_version, holdUntil, JSON.stringify(patch), businessId, bookingId,
+      ]
+    );
+    await client.query('COMMIT');
+    return { booking: await getBooking(businessId, bookingId), moved: true };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e instanceof BookingConflictError) throw e;
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Merges a JSON patch into a commercial action's metadata (used by the BOOK
+ * executor to record the resulting booking id without a new status cycle).
+ */
+export async function updateCommercialActionMetadata(businessId, id, patch) {
+  const res = await pool.query(
+    `UPDATE commercial_actions SET metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb, updated_at = CURRENT_TIMESTAMP
+     WHERE business_id = $1 AND id = $2`,
+    [businessId, id, JSON.stringify(patch)]
+  );
+  return res.rowCount > 0;
 }

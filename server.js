@@ -134,11 +134,35 @@ import {
   upsertChannelConfig,
   listChannelConfigs,
   findDefaultAgent,
+  getBookingConfig,
+  listBookingConfigs,
+  putBookingConfig,
+  deleteBookingConfig,
+  reserveBooking,
+  getBooking,
+  listBookings,
+  transitionBooking,
+  expireStaleBookings,
+  rescheduleBooking,
+  updateCommercialActionMetadata,
+  BookingConflictError,
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
 import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendChannelMessage } from './channel-adapter.js';
 import { initializeOrderPayment, handleProviderWebhook } from './payment-service.js';
 import { _setPaystackHttp as setPaymentProviderHttp } from './payment-provider.js';
+import {
+  availableSlots as bookingAvailableSlots,
+  isExactSlot as bookingIsExactSlot,
+} from './booking-time.js';
+import {
+  BOOKING_STATUSES,
+  BOOKING_STATUS_SET,
+  canTransition as bookingCanTransition,
+  normalizeBookingConfig as normalizeBookingConfigPayload,
+  issueSlotToken as issueBookingSlotToken,
+  parseSlotToken as parseBookingSlotToken,
+} from './booking-provider.js';
 
 // TEST SEAM (13B): lets the suite substitute the provider HTTP transport. The
 // Paystack adapter is provider-neutral and never coupled to order logic.
@@ -923,6 +947,8 @@ app.use('/v1/analytics', requireAuth);
 app.use('/v1/billing', requireAuth);
 app.use('/v1/products', requireAuth);
 app.use('/v1/business', requireAuth);
+app.use('/v1/bookings', requireAuth);
+app.use('/v1/booking', requireAuth);
 
 /**
  * AI HELPERS
@@ -937,7 +963,7 @@ function truncateContext(value, maxChars) {
   return `${trimmed.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
-function buildAgentSystemInstruction(agent, targetLanguage, currencyCode = null, { salesState = null, products = null, handoff = null } = {}) {
+function buildAgentSystemInstruction(agent, targetLanguage, currencyCode = null, { salesState = null, products = null, handoff = null, bookingSlots = null } = {}) {
   const name = agent.name || 'Agent';
   const industry = agent.industry || 'General';
   const voice = agent.voice || 'professional';
@@ -996,7 +1022,7 @@ ${documents
   }
   const handoffBlock = buildHandoffBlock(handoffChannels);
   if (handoffBlock) sections.push(handoffBlock);
-  if (salesState) sections.push(buildSalesStateBlock(salesState, handoffChannels));
+  if (salesState) sections.push(buildSalesStateBlock(salesState, handoffChannels, bookingSlots));
 
   sections.push(`PRICING RIGHTS
 - You may state a price ONLY if it appears in the SERVICE CATALOG above.
@@ -1067,9 +1093,9 @@ FORMATTING:
 
   return sections.join('\n\n');
 }
-async function runAgentChat({ agent, history, userInput, targetLanguage, currencyCode = null, salesState = null, products = null, handoff = null }) {
+async function runAgentChat({ agent, history, userInput, targetLanguage, currencyCode = null, salesState = null, products = null, handoff = null, bookingSlots = null }) {
   const messages = [
-    { role: 'system', content: buildAgentSystemInstruction(agent, targetLanguage, currencyCode, { salesState, products, handoff }) },
+    { role: 'system', content: buildAgentSystemInstruction(agent, targetLanguage, currencyCode, { salesState, products, handoff, bookingSlots }) },
     ...history.map(m => ({
       role: m.role === 'model' || m.role === 'assistant' ? 'assistant' : 'user',
       content: m.text,
@@ -1426,7 +1452,7 @@ ${lines.join('\n')}
 You may offer ONLY the channels listed above as a real next step (for example, "I can arrange a call on WhatsApp" or "you can book directly here"). Never mention, imply, or offer any channel that is not listed. If no channel is configured, do not offer any handoff at all — simply keep the conversation going helpfully.`;
 }
 
-function buildSalesStateBlock(state, channels) {
+function buildSalesStateBlock(state, channels, bookingSlots = null) {
   const s = state || {};
   const stage = SALES_STAGES.includes(s.stage) ? s.stage : 'engage';
   const lines = [];
@@ -1482,7 +1508,41 @@ PAYMENT RULES (server-authoritative — do not improvise):
 - Payments are processed only by the server through a verified payment provider. NEVER tell the customer that a payment paid, succeeded, failed, refunded, or is "being processed" unless the server itself reported that verified provider outcome. A customer message like "I have paid" or "payment sent" is NOT evidence of payment — never treat it as success and never bypass verification.
 - The order total and currency created by the server are authoritative. NEVER quote, imply, or invent a different total, subtotal, or currency, and never recompute amounts.
 - You may explain the payment steps and ask whether the customer wants to proceed.
-- You may INITIATE a payment on the customer's behalf through the server using the START_PAYMENT conversion action; the server returns an official secure checkout link/button. Present exactly what the server returns — never fabricate a link, payment reference, transaction reference, or confirmation number yourself.`.trimEnd();
+- You may INITIATE a payment on the customer's behalf through the server using the START_PAYMENT conversion action; the server returns an official secure checkout link/button. Present exactly what the server returns — never fabricate a link, payment reference, transaction reference, or confirmation number yourself.
+${buildBookingRulesBlock(bookingSlots)}`.trimEnd();
+}
+
+/**
+ * Server-authoritative booking guidance for the sales-state facts block. The
+ * only bookable times the AI may ever mention are the exact options the server
+ * computed here; everything else is a hallucination the AI must never produce.
+ */
+function buildBookingRulesBlock(bookingSlots) {
+  const options = bookingSlots && Array.isArray(bookingSlots.slots) && bookingSlots.slots.length > 0
+    ? bookingSlots.slots
+        .map((s) => `${s.localDate} ${s.localStart}-${s.localEnd} (${bookingSlots.timezone})`)
+        .join('; ')
+    : null;
+
+  return `BOOKING RULES (server-authoritative — do not improvise):
+${options
+    ? `BOOKABLE OPTIONS (exactly these times, no others): ${options}. Only the application can reserve one of these; never propose, mention, or invent any other time or date for this product.`
+    : 'No bookable times are currently being offered for the recommended product.'}
+- Only the application can create a booking, and it does so only through the server. You may offer a bookable option and, when the customer accepts, propose the BOOK conversion action so the server reserves it.
+- NEVER tell the customer that a booking has been reserved, confirmed, rescheduled, completed, cancelled, or expired unless the server itself returned that verified outcome. A customer message like "I booked" or "I confirmed it" is NOT evidence of a booking.
+- When the server returns a confirmed booking, present exactly what it returned — never fabricate a booking reference, confirmation number, date, or time.
+- If no bookable times exist or the customer wants a different time, do not improvise: offer the configured contact/booking-link next step instead.`.trim();
+}
+
+async function buildBookingPromptSlots({ businessId, salesState, products }) {
+  if (!salesState || salesState.nextBestAction !== 'offer_booking' || !salesState.recommendedProductId) return null;
+  const product = (Array.isArray(products) ? products : []).find((p) => p.id === salesState.recommendedProductId);
+  if (!product || !product.bookable) return null;
+  const config = await getBookingConfig(businessId, product.id);
+  if (!config) return null;
+  const slots = bookingAvailableSlots({ config, nowUtc: new Date(), count: 5 });
+  if (slots.length === 0) return null;
+  return { productId: product.id, productName: product.name, timezone: config.timezone, slots };
 }
 
 /**
@@ -1805,6 +1865,8 @@ app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
       });
     }
 
+    const bookingSlots = await buildBookingPromptSlots({ businessId: req.business.id, salesState, products });
+
     const text = await runAgentChat({
       agent: resolvedAgent || agent,
       history: history || [],
@@ -1814,6 +1876,7 @@ app.post('/v1/ai/chat', asyncHandler(async (req, res) => {
       salesState,
       products,
       handoff: business || {},
+      bookingSlots,
     });
 
     // Persist the re-derived state for real conversations so the sandbox and a
@@ -1901,6 +1964,16 @@ const FUNNEL_EVENT_TYPES = new Set([
   'order_fulfillment_started',
   'order_fulfilled',
   'order_cancelled',
+  // Phase 13C booking lifecycle events. Each is recorded ONLY when the server
+  // itself performed the transition (reserve/confirm/cancel/reschedule/
+  // complete/no-show/expire); the AI can never emit them.
+  'booking_reserved',
+  'booking_confirmed',
+  'booking_cancelled',
+  'booking_rescheduled',
+  'booking_no_show',
+  'booking_completed',
+  'booking_expired',
 ]);
 
 async function recordFunnelEvent({ businessId, conversationId = null, eventType, meta = null }) {
@@ -2620,6 +2693,7 @@ const publicProduct = (p) => ({
   price: Number(p.price),
   currency: p.currency,
   status: p.status,
+  bookable: p.bookable,
   metadata: p.metadata || {},
   createdAt: p.created_at,
   updatedAt: p.updated_at,
@@ -2671,6 +2745,10 @@ function validateProductPayload(body, { partial = false } = {}) {
     errors.status = `status must be one of: ${PRODUCT_STATUSES.join(', ')}`;
   }
 
+  if (body.bookable !== undefined && body.bookable !== null && typeof body.bookable !== 'boolean') {
+    errors.bookable = 'bookable must be a boolean';
+  }
+
   if (body.metadata !== undefined && body.metadata !== null) {
     if (typeof body.metadata !== 'object' || Array.isArray(body.metadata)) {
       errors.metadata = 'metadata must be an object';
@@ -2685,7 +2763,9 @@ app.get('/v1/products', asyncHandler(async (req, res) => {
   const products = await listProducts(req.business.id, {
     status: typeof req.query.status === 'string' && PRODUCT_STATUSES.includes(req.query.status) ? req.query.status : null,
   });
-  res.status(200).json({ products: products.map(publicProduct) });
+  const bookableOnly = req.query.bookable === 'true';
+  const filtered = bookableOnly ? products.filter((p) => p.bookable) : products;
+  res.status(200).json({ products: filtered.map(publicProduct) });
 }));
 
 // Create a product, enforcing the business plan's structured-catalog limit.
@@ -2736,6 +2816,7 @@ app.put('/v1/products/:id', asyncHandler(async (req, res) => {
     price: body.price !== undefined ? Number(body.price) : undefined,
     currency: body.currency !== undefined ? String(body.currency).trim().toUpperCase() : undefined,
     status: body.status,
+    bookable: body.bookable !== undefined ? body.bookable : undefined,
     metadata: body.metadata !== undefined ? body.metadata : undefined,
   });
   res.status(200).json({ product: publicProduct(updated) });
@@ -2974,6 +3055,7 @@ async function runConversationEngine({ touchpoint = null, business = null, agent
 
   let replyText;
   try {
+    const bookingSlots = await buildBookingPromptSlots({ businessId, salesState, products });
     replyText = await runAgentChat({
       agent,
       history,
@@ -2982,6 +3064,7 @@ async function runConversationEngine({ touchpoint = null, business = null, agent
       salesState,
       products,
       handoff: owner || {},
+      bookingSlots,
     });
   } catch (error) {
     // Never surface the provider error to a customer: log the full detail
@@ -4488,12 +4571,508 @@ app.post('/v1/commercial/actions/:id/execute', requireAuth, asyncHandler(async (
     });
   }
 
-  if (action.action_type === 'REQUEST_QUOTE' || action.action_type === 'BOOK'
+  if (action.action_type === 'BOOK') {
+    // Phase 13C executor: books the exact server-issued slot on the action's
+    // product using the signed slot token proposed with the action. The server
+    // performs the reservation and returns authoritative confirmation; the AI
+    // never claims a booking exists.
+    if (!action.product_id) {
+      return res.status(409).json({ error: 'No bookable product is attached to this action.', code: 'ACTION_NOT_EXECUTABLE' });
+    }
+    const slotToken = action.metadata && typeof action.metadata.slotToken === 'string' ? action.metadata.slotToken : null;
+    if (!slotToken) {
+      return res.status(409).json({ error: 'No server-issued time slot is attached to this action.', code: 'ACTION_NOT_EXECUTABLE' });
+    }
+    const result = await performBookingReservation(req.business.id, {
+      productId: action.product_id,
+      token: slotToken,
+      customer: action.customer || {},
+      conversationId: action.conversation_id,
+    });
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error, code: result.code });
+    }
+    const moved = await setCommercialActionStatus(req.business.id, action.id, 'executed', 'proposed');
+    if (!moved) return res.status(409).json({ error: 'Action state changed while processing; retry', code: 'STALE_STATE' });
+    await updateCommercialActionMetadata(req.business.id, action.id, {
+      bookingId: result.booking.id,
+      bookingStatus: result.booking.status,
+    });
+    if (!result.duplicate) {
+      await recordBookingFunnelEvent(req.business.id, action.conversation_id, 'booking_reserved', result.booking);
+      if (result.booking.status === BOOKING_STATUSES.CONFIRMED) {
+        await recordBookingFunnelEvent(req.business.id, action.conversation_id, 'booking_confirmed', result.booking);
+      }
+    }
+    const fresh = await getCommercialAction(req.business.id, action.id);
+    return res.status(200).json({
+      action: publicCommercialAction(fresh),
+      booking: publicBooking(result.booking),
+    });
+  }
+
+  if (action.action_type === 'REQUEST_QUOTE'
     || action.action_type === 'REQUEST_DEMO' || action.action_type === 'TALK_TO_HUMAN') {
     return res.status(409).json({ error: 'This action type has no server-side executor yet in Phase 13A.', code: 'ACTION_NOT_EXECUTABLE' });
   }
 
   return res.status(409).json({ error: 'Action cannot be executed', code: 'ACTION_NOT_EXECUTABLE' });
+}));
+
+// BOOKING (Phase 13C)
+//
+// Deterministic, server-authoritative scheduling. Two surfaces:
+//   - Customer: /v1/t/:trackingId/booking/* — availability and reservation
+//     only. Slots are server-computed from the configured grid and handed to
+//     the customer as signed opaque tokens; the server performs the reserve.
+//   - Business: /v1/booking/configs and /v1/bookings/* (requireAuth) — booking
+//     policy management and the full lifecycle (confirm/cancel/complete/
+//     no-show/reschedule/expire), locked behind the auth gates above.
+//
+// Booking status is a server state machine; no request body can ever set it.
+
+const bookingTokenSecret = config.jwtSecret;
+
+const OCCUPYING_BOOKING_STATUSES = new Set(['reserved', 'confirmed']);
+
+const publicBooking = (b) => ({
+  id: b.id,
+  productId: b.product_id,
+  productName: b.product_name,
+  conversationId: b.conversation_id,
+  leadId: b.lead_id,
+  customer: b.customer || {},
+  name: b.name,
+  phone: b.phone,
+  email: b.email,
+  timezone: b.timezone,
+  durationMinutes: b.duration_minutes,
+  requestedStartAt: b.requested_start_at,
+  endAt: b.end_at,
+  status: b.status,
+  holdUntil: b.hold_until || null,
+  configVersion: b.config_version,
+  metadata: b.metadata || {},
+  createdAt: b.created_at,
+  updatedAt: b.updated_at,
+});
+
+const publicBookingConfig = (c) => ({
+  productId: c.product_id,
+  productName: c.product_name,
+  productBookable: c.product_bookable,
+  timezone: c.timezone,
+  slotDurationMinutes: c.slot_duration_minutes,
+  bufferMinutes: c.buffer_minutes,
+  capacity: c.capacity,
+  operatingHours: c.operating_hours,
+  blackoutDates: c.blackout_dates,
+  minAdvanceHours: c.min_advance_hours,
+  maxAdvanceDays: c.max_advance_days,
+  autoConfirm: c.auto_confirm,
+  holdMinutes: c.hold_minutes,
+  allowReschedule: c.allow_reschedule,
+  requiresPayment: c.requires_payment,
+  configVersion: c.config_version,
+  createdAt: c.created_at,
+  updatedAt: c.updated_at,
+});
+
+const publicBookingSlot = (slot, available, token) => ({
+  startUtc: slot.start.toISOString(),
+  endUtc: slot.end.toISOString(),
+  localStart: slot.localStart,
+  localEnd: slot.localEnd,
+  localDate: slot.localDate,
+  durationMinutes: slot.durationMinutes,
+  available,
+  token: available ? token : null,
+});
+
+async function recordBookingFunnelEvent(businessId, conversationId, eventType, booking) {
+  await recordFunnelEventOnce({
+    businessId,
+    conversationId: conversationId || (booking && booking.conversation_id) || null,
+    eventType,
+    key: booking ? `booking:${booking.id}` : null,
+    meta: booking
+      ? { bookingId: booking.id, productId: booking.product_id, status: booking.status }
+      : null,
+  });
+}
+
+/**
+ * The single reservation path shared by the public reserve route and the BOOK
+ * commercial-action executor: token parse -> tenant/product match ->
+ * config version pin -> exact-grid check -> transactional advisory-locked
+ * insert. Returns { booking, duplicate } or { error, code, status }.
+ */
+async function performBookingReservation(businessId, { productId, token, customer = {}, conversationId = null, idempotencyKey = null }) {
+  const parsed = parseBookingSlotToken({ secret: bookingTokenSecret, token });
+  if (!parsed) {
+    return { error: 'Invalid or tampered time-slot token.', code: 'INVALID_SLOT_TOKEN', status: 400 };
+  }
+  if (parsed.businessId !== businessId || parsed.productId !== productId) {
+    return { error: 'The time-slot token does not match the requested product.', code: 'INVALID_SLOT_TOKEN', status: 400 };
+  }
+  const config = await getBookingConfig(businessId, productId);
+  if (!config) {
+    return { error: 'This product has no booking configuration.', code: 'CONFIG_REQUIRED', status: 409 };
+  }
+  if (config.config_version !== parsed.configVersion) {
+    return { error: 'Availability changed after these options were shown — refresh them.', code: 'STALE_SLOT', status: 409 };
+  }
+  if (!bookingIsExactSlot({ config, start: parsed.start, end: parsed.end, nowUtc: new Date() })) {
+    return { error: 'This slot is no longer on the schedule.', code: 'INVALID_SLOT', status: 409 };
+  }
+  try {
+    return await reserveBooking({
+      businessId,
+      productId,
+      conversationId,
+      slot: {
+        start: parsed.start,
+        end: parsed.end,
+        durationMinutes: config.slot_duration_minutes,
+      },
+      config,
+      customer,
+      name: customer.name || null,
+      phone: customer.phone || null,
+      email: customer.email || null,
+      idempotencyKey: idempotencyKey || null,
+      now: new Date(),
+    });
+  } catch (error) {
+    if (error instanceof BookingConflictError) {
+      return { error: error.message, code: error.code, status: 409 };
+    }
+    throw error;
+  }
+}
+
+/**
+ * State-machine transition shared by the management endpoints. The target
+ * transition must be legal for the booking's current status (CAS on status to
+ * stay safe under concurrency) and the server must have actually performed the
+ * underlying action. Returns { booking, error, code, status, duplicate }.
+ */
+async function performBookingTransition(businessId, id, to, { patch = null, from = null } = {}) {
+  const booking = await getBooking(businessId, id);
+  if (!booking) return { error: 'Booking not found', code: 'NOT_FOUND', status: 404 };
+  if (booking.status === to) {
+    return { booking, error: null, status: 200, duplicate: true };
+  }
+  const allowedFrom = from || Array.from(BOOKING_STATUS_SET).filter((s) => bookingCanTransition(s, to));
+  if (!allowedFrom.includes(booking.status)) {
+    return { error: `Booking cannot transition from ${booking.status} to ${to}.`, code: 'INVALID_TRANSITION', status: 409 };
+  }
+  const moved = await transitionBooking(businessId, id, { to, from: allowedFrom, patch });
+  if (!moved) return { error: 'Booking state changed while processing; retry', code: 'STALE_STATE', status: 409 };
+  return { booking: moved, error: null, status: 200, duplicate: false };
+}
+
+// Customer availability: exact slots for a bookable product of the touchpoint's
+// business, with live capacity applied and available slots carrying a signed
+// token for reservation.
+app.get('/v1/t/:trackingId/booking/available', asyncHandler(async (req, res) => {
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
+  if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
+  if (!touchpoint.active) return res.status(410).json({ error: 'This touchpoint is no longer active' });
+
+  const productId = typeof req.query.productId === 'string' ? req.query.productId.trim() : '';
+  if (!productId) return res.status(400).json({ error: 'productId is required' });
+  const product = await getProductById(touchpoint.business_id, productId);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+  if (!product.bookable) {
+    return res.status(409).json({ error: 'This product is not bookable.', code: 'NOT_BOOKABLE' });
+  }
+  const config = await getBookingConfig(touchpoint.business_id, productId);
+  if (!config) {
+    return res.status(409).json({ error: 'This product has no booking configuration.', code: 'CONFIG_REQUIRED' });
+  }
+
+  const rawCount = Number.parseInt(req.query.count, 10);
+  const count = Number.isInteger(rawCount) ? Math.min(Math.max(rawCount, 1), 20) : 10;
+  const fromUtc = typeof req.query.from === 'string' && Number.isFinite(Date.parse(req.query.from))
+    ? new Date(req.query.from)
+    : null;
+
+  try {
+    await expireStaleBookings(touchpoint.business_id);
+  } catch (error) {
+    console.error('[Booking] Stale expiry failed:', error.message);
+  }
+
+  const slots = bookingAvailableSlots({ config, nowUtc: new Date(), fromUtc, count });
+
+  let occupying = [];
+  if (slots.length > 0) {
+    occupying = await listBookings(touchpoint.business_id, {
+      productId,
+      from: slots[0].start,
+      to: slots[slots.length - 1].end,
+    });
+  }
+  const occupyingIntervals = occupying
+    .filter((b) => OCCUPYING_BOOKING_STATUSES.has(b.status))
+    .map((b) => ({ start: new Date(b.requested_start_at), end: new Date(b.end_at) }));
+
+  const populated = slots.map((slot) => {
+    const overlap = occupyingIntervals.filter((iv) => iv.start < slot.end && iv.end > slot.start).length;
+    const available = overlap < config.capacity;
+    const token = available
+      ? issueBookingSlotToken({
+          secret: bookingTokenSecret,
+          businessId: touchpoint.business_id,
+          productId,
+          configVersion: config.config_version,
+          start: slot.start,
+          end: slot.end,
+        })
+      : null;
+    return publicBookingSlot(slot, available, token);
+  });
+
+  res.status(200).json({
+    product: { id: product.id, name: product.name },
+    timezone: config.timezone,
+    capacity: config.capacity,
+    slots: populated,
+  });
+}));
+
+// Customer reservation: the only way a booking row is ever created. Returns
+// the freshly created (auto)confirmed/reserved booking.
+app.post('/v1/t/:trackingId/booking/reserve', asyncHandler(async (req, res) => {
+  const touchpoint = await resolvePublicTouchpoint(req.params.trackingId);
+  if (!touchpoint) return res.status(404).json({ error: 'Touchpoint not found' });
+  if (!touchpoint.active) return res.status(410).json({ error: 'This touchpoint is no longer active' });
+
+  const body = req.body || {};
+  const productId = typeof body.productId === 'string' ? body.productId.trim() : '';
+  const token = typeof body.token === 'string' && body.token ? body.token : '';
+  if (!productId || !token) {
+    return res.status(400).json({ error: 'productId and token are required' });
+  }
+  const product = await getProductById(touchpoint.business_id, productId);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+  if (!product.bookable) {
+    return res.status(409).json({ error: 'This product is not bookable.', code: 'NOT_BOOKABLE' });
+  }
+
+  let conversationId = null;
+  if (body.conversationId !== undefined && body.conversationId !== null && body.conversationId !== '') {
+    if (typeof body.conversationId !== 'string') {
+      return res.status(400).json({ error: 'conversationId must be a string' });
+    }
+    const conversation = await getConversationById(body.conversationId);
+    if (!conversation || conversation.touchpoint_id !== touchpoint.id || conversation.business_id !== touchpoint.business_id) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    conversationId = conversation.id;
+  }
+
+  const customer = body.customer && typeof body.customer === 'object' && !Array.isArray(body.customer)
+    ? {
+        name: cleanName(body.customer.name),
+        phone: cleanPhone(body.customer.phone),
+        email: cleanEmail(body.customer.email),
+      }
+    : { name: null, phone: null, email: null };
+
+  const idempotencyKey = typeof body.idempotencyKey === 'string' && body.idempotencyKey
+    ? body.idempotencyKey.trim().slice(0, 200)
+    : null;
+
+  try {
+    await expireStaleBookings(touchpoint.business_id);
+  } catch (error) {
+    console.error('[Booking] Stale expiry failed:', error.message);
+  }
+
+  const result = await performBookingReservation(touchpoint.business_id, {
+    productId,
+    token,
+    customer: { name: customer.name, phone: customer.phone, email: customer.email },
+    conversationId,
+    idempotencyKey,
+  });
+  if (result.error) {
+    return res.status(result.status).json({ error: result.error, code: result.code });
+  }
+
+  if (!result.duplicate) {
+    await recordBookingFunnelEvent(touchpoint.business_id, conversationId, 'booking_reserved', result.booking);
+    if (result.booking.status === BOOKING_STATUSES.CONFIRMED) {
+      await recordBookingFunnelEvent(touchpoint.business_id, conversationId, 'booking_confirmed', result.booking);
+    }
+  }
+  res.status(result.duplicate ? 200 : 201).json({ booking: publicBooking(result.booking) });
+}));
+
+// Business booking policy management (locked by app.use('/v1/booking', requireAuth)).
+app.get('/v1/booking/configs', asyncHandler(async (req, res) => {
+  const configs = await listBookingConfigs(req.business.id);
+  res.status(200).json({ configs: configs.map(publicBookingConfig) });
+}));
+
+app.put('/v1/products/:id/booking-config', asyncHandler(async (req, res) => {
+  const product = await getProductById(req.business.id, req.params.id);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const normalized = normalizeBookingConfigPayload(req.body || {});
+  if (normalized.error) {
+    return res.status(400).json({ error: normalized.error });
+  }
+
+  const config = await putBookingConfig(req.business.id, product.id, normalized.value);
+  if (product.status === 'active') {
+    await updateProduct(req.business.id, product.id, { bookable: true });
+  }
+  const fresh = await getBookingConfig(req.business.id, product.id);
+  res.status(200).json({ config: publicBookingConfig(fresh) });
+}));
+
+app.delete('/v1/products/:id/booking-config', asyncHandler(async (req, res) => {
+  const product = await getProductById(req.business.id, req.params.id);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+  const removed = await deleteBookingConfig(req.business.id, product.id);
+  await updateProduct(req.business.id, product.id, { bookable: false });
+  res.status(200).json({ deleted: removed });
+}));
+
+// Business booking lifecycle (locked by app.use('/v1/bookings', requireAuth)).
+app.get('/v1/bookings', asyncHandler(async (req, res) => {
+  try {
+    await expireStaleBookings(req.business.id);
+  } catch (error) {
+    console.error('[Booking] Stale expiry failed:', error.message);
+  }
+  const status = typeof req.query.status === 'string' && BOOKING_STATUS_SET.has(req.query.status)
+    ? req.query.status
+    : null;
+  const productId = typeof req.query.productId === 'string' && req.query.productId ? req.query.productId : null;
+  const from = typeof req.query.from === 'string' && Number.isFinite(Date.parse(req.query.from)) ? new Date(req.query.from) : null;
+  const to = typeof req.query.to === 'string' && Number.isFinite(Date.parse(req.query.to)) ? new Date(req.query.to) : null;
+  const bookings = await listBookings(req.business.id, { status, productId, from, to });
+  res.status(200).json({ bookings: bookings.map(publicBooking) });
+}));
+
+app.get('/v1/bookings/:id', asyncHandler(async (req, res) => {
+  const booking = await getBooking(req.business.id, req.params.id);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  res.status(200).json({ booking: publicBooking(booking) });
+}));
+
+app.post('/v1/bookings/expire-stale', asyncHandler(async (req, res) => {
+  const expiredIds = await expireStaleBookings(req.business.id);
+  for (const id of expiredIds) {
+    const booking = await getBooking(req.business.id, id);
+    if (booking) await recordBookingFunnelEvent(req.business.id, null, 'booking_expired', booking);
+  }
+  res.status(200).json({ expired: expiredIds.length, bookingIds: expiredIds });
+}));
+
+app.post('/v1/bookings/:id/confirm', asyncHandler(async (req, res) => {
+  const result = await performBookingTransition(req.business.id, req.params.id, BOOKING_STATUSES.CONFIRMED, {
+    from: ['reserved'],
+    patch: { confirmed: { via: 'management' } },
+  });
+  if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+  if (!result.duplicate) {
+    await recordBookingFunnelEvent(req.business.id, result.booking.conversation_id, 'booking_confirmed', result.booking);
+  }
+  res.status(result.status).json({ booking: publicBooking(result.booking) });
+}));
+
+app.post('/v1/bookings/:id/cancel', asyncHandler(async (req, res) => {
+  const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 300) : null;
+  const result = await performBookingTransition(req.business.id, req.params.id, BOOKING_STATUSES.CANCELLED, {
+    from: ['reserved', 'confirmed'],
+    patch: { cancelled: { reason } },
+  });
+  if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+  if (!result.duplicate) {
+    await recordBookingFunnelEvent(req.business.id, result.booking.conversation_id, 'booking_cancelled', result.booking);
+  }
+  res.status(result.status).json({ booking: publicBooking(result.booking) });
+}));
+
+app.post('/v1/bookings/:id/complete', asyncHandler(async (req, res) => {
+  const result = await performBookingTransition(req.business.id, req.params.id, BOOKING_STATUSES.COMPLETED, {
+    from: ['confirmed'],
+    patch: { completed: {} },
+  });
+  if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+  if (!result.duplicate) {
+    await recordBookingFunnelEvent(req.business.id, result.booking.conversation_id, 'booking_completed', result.booking);
+  }
+  res.status(result.status).json({ booking: publicBooking(result.booking) });
+}));
+
+app.post('/v1/bookings/:id/no-show', asyncHandler(async (req, res) => {
+  const result = await performBookingTransition(req.business.id, req.params.id, BOOKING_STATUSES.NO_SHOW, {
+    from: ['confirmed'],
+    patch: { noShow: {} },
+  });
+  if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+  if (!result.duplicate) {
+    await recordBookingFunnelEvent(req.business.id, result.booking.conversation_id, 'booking_no_show', result.booking);
+  }
+  res.status(result.status).json({ booking: publicBooking(result.booking) });
+}));
+
+app.post('/v1/bookings/:id/reschedule', asyncHandler(async (req, res) => {
+  const booking = await getBooking(req.business.id, req.params.id);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  if (!['reserved', 'confirmed'].includes(booking.status)) {
+    return res.status(409).json({ error: `Booking cannot be rescheduled from ${booking.status}.`, code: 'INVALID_TRANSITION' });
+  }
+  const config = await getBookingConfig(req.business.id, booking.product_id);
+  if (!config) return res.status(409).json({ error: 'This product has no booking configuration.', code: 'CONFIG_REQUIRED' });
+  if (!config.allow_reschedule) {
+    return res.status(409).json({ error: 'Rescheduling is disabled for this product.', code: 'RESCHEDULE_DISABLED' });
+  }
+
+  const body = req.body || {};
+  const token = typeof body.token === 'string' && body.token ? body.token : '';
+  if (!token) return res.status(400).json({ error: 'token is required' });
+  const parsed = parseBookingSlotToken({ secret: bookingTokenSecret, token });
+  if (!parsed) {
+    return res.status(400).json({ error: 'Invalid or tampered time-slot token.', code: 'INVALID_SLOT_TOKEN' });
+  }
+  if (parsed.businessId !== req.business.id || parsed.productId !== booking.product_id) {
+    return res.status(400).json({ error: 'The time-slot token does not match this booking.', code: 'INVALID_SLOT_TOKEN' });
+  }
+  if (config.config_version !== parsed.configVersion) {
+    return res.status(409).json({ error: 'Availability changed after these options were shown — refresh them.', code: 'STALE_SLOT' });
+  }
+  if (!bookingIsExactSlot({ config, start: parsed.start, end: parsed.end, nowUtc: new Date() })) {
+    return res.status(409).json({ error: 'This slot is no longer on the schedule.', code: 'INVALID_SLOT' });
+  }
+
+  let result;
+  try {
+    result = await rescheduleBooking({
+      businessId: req.business.id,
+      bookingId: booking.id,
+      config,
+      newSlot: { productId: booking.product_id, start: parsed.start, end: parsed.end },
+      requireStatuses: ['reserved', 'confirmed'],
+      now: new Date(),
+    });
+  } catch (error) {
+    if (error instanceof BookingConflictError) {
+      return res.status(409).json({ error: error.message, code: error.code });
+    }
+    throw error;
+  }
+  if (!result.moved) {
+    return res.status(409).json({ error: 'Booking state changed while processing; retry', code: 'STALE_STATE' });
+  }
+  await recordBookingFunnelEvent(req.business.id, result.booking.conversation_id, 'booking_rescheduled', result.booking);
+  res.status(200).json({ booking: publicBooking(result.booking) });
 }));
 
 // CHANNEL CONFIGURATION (public settings only)
