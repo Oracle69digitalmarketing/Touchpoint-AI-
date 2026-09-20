@@ -23,6 +23,7 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +34,11 @@ process.env.GROQ_API_KEY = 'gsk_test_dummy';
 process.env.PAYSTACK_SECRET_KEY = 'sk_test_dummy';
 process.env.APP_URL = 'https://app.example.test';
 process.env.NODE_ENV = 'test';
+process.env.WHATSAPP_ACCESS_TOKEN = 'test-meta-access-token';
+process.env.WHATSAPP_PHONE_NUMBER_ID = '100000000000001';
+process.env.WHATSAPP_APP_SECRET = 'test-meta-app-secret';
+process.env.WHATSAPP_BUSINESS_ACCOUNT_ID = '200000000000002';
+process.env.WHATSAPP_VERIFY_TOKEN = 'test-verify-token-0123456789';
 
 const testPool = await setupTestDb();
 
@@ -48,7 +54,7 @@ if (!fs.existsSync(tHtmlPath)) {
   );
 }
 
-const { default: app, _setGroqClient, _setPaystackHttp } = await import(path.join(__dirname, '..', 'server.js'));
+const { default: app, _setGroqClient, _setPaystackHttp, _setWhatsAppHttp } = await import(path.join(__dirname, '..', 'server.js'));
 
 // Phase 13B: the payment-init path lives behind the provider HTTP seam. The
 // fake transport returns an authoritative checkout without any network call;
@@ -67,6 +73,22 @@ _setPaystackHttp({
   async verify() {
     throw new Error('verify is not used by the Phase 13A suite');
   },
+});
+
+// Phase 13D-Batch A: WhatsApp outbound goes through the real adapter with the
+// transport substituted — production always calls the real Meta Graph API.
+let waOutboundCalls = 0;
+_setWhatsAppHttp(async ({ accessToken, payload, timeoutMs }) => {
+  assert.equal(accessToken, process.env.WHATSAPP_ACCESS_TOKEN);
+  assert.ok(timeoutMs > 0);
+  waOutboundCalls += 1;
+  return {
+    data: {
+      messaging_product: 'whatsapp',
+      contacts: [{ input: payload.to, wa_id: payload.to }],
+      messages: [{ id: `wamid.out.p13a.${waOutboundCalls}` }],
+    },
+  };
 });
 
 const capturedSystemPrompts = [];
@@ -99,14 +121,14 @@ after(async () => {
   await cleanupTestDb(testPool);
 });
 
-const request = async (url, { method = 'GET', body, token, raw = false } = {}) => {
-  const headers = {};
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
+const request = async (url, { method = 'GET', body, token, raw = false, rawBody = null, headers: extraHeaders = {} } = {}) => {
+  const headers = { ...extraHeaders };
+  if (body !== undefined && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(base + url, {
     method,
     headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: rawBody !== null ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (raw) return { status: res.status, text: await res.text() };
   const json = await res.json().catch(() => ({}));
@@ -445,43 +467,82 @@ test('11. non-backed action types cannot be executed in Phase 13A', async () => 
   assert.equal(crossTenant.status, 404);
 });
 
-test('12. whatsapp inbound mock: same engine and reply, deterministic channel identity, mock outbound', async () => {
-  // First contact creates a whatsapp-channel conversation with NO touchpoint.
-  const first = await request('/v1/channel/whatsapp/inbound', {
-    method: 'POST',
-    body: { businessId: businessB.business.id, from: '+2348000000001', message: 'Hi', targetLanguage: 'en' },
+test('12. whatsapp inbound: SAME engine and reply, deterministic channel identity, real outbound contract', async () => {
+  // Bind business B's WhatsApp channel to a Meta phone number id (public
+  // identifier, never a secret — the same boundary Phase 13A enforces).
+  const PHONE_B = '17000000000002';
+  const bind = await request('/v1/business/channels/whatsapp', {
+    method: 'PUT',
+    token: businessB.token,
+    body: { enabled: true, phoneNumberId: PHONE_B },
   });
+  assert.equal(bind.status, 200);
+
+  const sign = (payload) => {
+    const raw = JSON.stringify(payload);
+    const sig = crypto.createHmac('sha256', process.env.WHATSAPP_APP_SECRET).update(raw).digest('hex');
+    return { rawBody: raw, headers: { 'Content-Type': 'application/json', 'X-Hub-Signature-256': `sha256=${sig}` } };
+  };
+  const webhook = (payload) => {
+    const { rawBody, headers } = sign(payload);
+    return request('/v1/channel/whatsapp/webhook', { method: 'POST', rawBody, headers });
+  };
+  const waEnv = (number, text, waMessageId) => ({
+    object: 'whatsapp_business_account',
+    entry: [{
+      id: 'p13a-entry',
+      changes: [{
+        value: {
+          messaging_product: 'whatsapp',
+          metadata: { display_phone_number: '15550123456', phone_number_id: PHONE_B },
+          contacts: [{ profile: { name: 'Cust' }, wa_id: number.replace(/\D/g, '') }],
+          messages: [{ from: number, id: waMessageId, timestamp: '1730000000', type: 'text', text: { body: text } }],
+        },
+        field: 'messages',
+      }],
+    }],
+  });
+  let waSeq = 0;
+  const nextWaId = () => `wamid.p13a.inb.${Date.now()}.${(waSeq += 1)}`;
+
+  // First contact creates a whatsapp-channel conversation with NO touchpoint.
+  const first = await webhook(waEnv('+2348000000001', 'Hi', nextWaId()));
   assert.equal(first.status, 200);
-  assert.equal(first.body.channel, 'whatsapp');
-  assert.equal(first.body.outbound.provider, 'mock');
-  assert.equal(first.body.outbound.ok, true);
+  assert.equal(first.body.received, true);
 
-  const replyText = first.body.messages[first.body.messages.length - 1].text;
-  assert.equal(replyText, 'Mock reply to: Hi');
+  // The ledger proves the real outbound contract: Meta accepted (returned an
+  // id) before status 'sent' is recorded.
+  const ledger = (await testPool.query(
+    'SELECT direction, status, body, wa_message_id FROM whatsapp_messages WHERE business_id = $1 ORDER BY created_at, id',
+    [businessB.business.id]
+  )).rows;
+  assert.equal(ledger.filter((r) => r.direction === 'inbound').length, 1);
+  const outbound = ledger.find((r) => r.direction === 'outbound');
+  assert.ok(outbound);
+  assert.equal(outbound.status, 'sent');
+  assert.equal(outbound.wa_message_id, 'wamid.out.p13a.1');
+  assert.equal(outbound.body, 'Mock reply to: Hi');
 
-  // Verify the conversation exists without a touchpoint and is channel-tagged.
-  const conv = (await request('/v1/conversations', { token: businessB.token })).body.conversations
-    .find((c) => c.id === first.body.conversationId);
+  const firstBody = await request('/v1/conversations', { token: businessB.token });
+  const convs = firstBody.body.conversations;
+  const convIdsSince = convs.length;
+  const conv = convs.find((c) => c.channel === 'whatsapp');
   assert.ok(conv);
   assert.equal(conv.touchpointId, null);
   assert.equal(conv.channel, 'whatsapp');
 
   // Second message from the same sender reuses the SAME conversation (identity).
-  const second = await request('/v1/channel/whatsapp/inbound', {
-    method: 'POST',
-    body: { businessId: businessB.business.id, from: '+2348000000001', message: 'Again' },
-  });
+  const second = await webhook(waEnv('+2348000000001', 'Again', nextWaId()));
   assert.equal(second.status, 200);
-  assert.equal(second.body.conversationId, first.body.conversationId);
-  assert.equal(second.body.messages[second.body.messages.length - 1].text, 'Mock reply to: Again');
+  const afterSecond = (await request('/v1/conversations', { token: businessB.token })).body.conversations;
+  assert.equal(afterSecond.length, convIdsSince, 'no new conversation for the same sender');
+  assert.equal(afterSecond.find((c) => c.channel === 'whatsapp').id, conv.id);
 
   // A different sender resolves to a DIFFERENT conversation.
-  const other = await request('/v1/channel/whatsapp/inbound', {
-    method: 'POST',
-    body: { businessId: businessB.business.id, from: '+2348000000002', message: 'Hello' },
-  });
+  const other = await webhook(waEnv('+2348000000002', 'Hello', nextWaId()));
   assert.equal(other.status, 200);
-  assert.notEqual(other.body.conversationId, first.body.conversationId);
+  const afterOther = (await request('/v1/conversations', { token: businessB.token })).body.conversations;
+  assert.equal(afterOther.length, convIdsSince + 1);
 
   // Web chat produces the same engine output as whatsapp for the same message
   // (one engine, no second WhatsApp brain).

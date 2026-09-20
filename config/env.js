@@ -42,6 +42,11 @@ const NORMALIZED_ENV_KEYS = [
   'PAYMENT_PROVIDER',
   'RESEND_API_KEY',
   'EMAIL_FROM',
+  'WHATSAPP_ACCESS_TOKEN',
+  'WHATSAPP_PHONE_NUMBER_ID',
+  'WHATSAPP_APP_SECRET',
+  'WHATSAPP_BUSINESS_ACCOUNT_ID',
+  'WHATSAPP_VERIFY_TOKEN',
 ];
 
 const normalizeEnv = (env = process.env) => {
@@ -114,6 +119,27 @@ export function validateEnvironment(rawEnv = process.env) {
       errors.push('CORS_ORIGIN is required in production (the browser origin(s) allowed to call the API)');
     } else if (env.CORS_ORIGIN.split(',').some((origin) => /^https?:\/\/localhost(:\d+)?$/.test(origin.trim()))) {
       errors.push('CORS_ORIGIN must not allow localhost origins in production');
+    }
+    // WhatsApp Cloud API is a first-class production channel: the deployment
+    // must supply the full Meta credential set. The app secret signs inbound
+    // webhooks, the verify token answers Meta's hub handshake, and the access
+    // token + phone number id drive outbound messaging.
+    if (!env.WHATSAPP_ACCESS_TOKEN) {
+      errors.push('WHATSAPP_ACCESS_TOKEN is required in production (Meta Cloud API server-side access token for outbound messaging)');
+    }
+    if (!env.WHATSAPP_PHONE_NUMBER_ID) {
+      errors.push('WHATSAPP_PHONE_NUMBER_ID is required in production (the Meta phone number id used for outbound messaging)');
+    }
+    if (!env.WHATSAPP_APP_SECRET) {
+      errors.push('WHATSAPP_APP_SECRET is required in production (Meta app secret used to verify X-Hub-Signature-256 on inbound webhooks)');
+    }
+    if (!env.WHATSAPP_BUSINESS_ACCOUNT_ID) {
+      errors.push('WHATSAPP_BUSINESS_ACCOUNT_ID is required in production (Meta WhatsApp Business Account id)');
+    }
+    if (!env.WHATSAPP_VERIFY_TOKEN) {
+      errors.push('WHATSAPP_VERIFY_TOKEN is required in production (the token returned to Meta during webhook verification)');
+    } else if (env.WHATSAPP_VERIFY_TOKEN.length < 8) {
+      errors.push('WHATSAPP_VERIFY_TOKEN must be at least 8 characters in production');
     }
   }
 
@@ -194,6 +220,11 @@ export function loadConfig(rawEnv = process.env) {
     databaseUrl: env.DATABASE_URL,
     trustProxy: env.TRUST_PROXY,
     paymentProvider: env.PAYMENT_PROVIDER || 'paystack',
+    whatsappAccessToken: env.WHATSAPP_ACCESS_TOKEN,
+    whatsappPhoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID,
+    whatsappAppSecret: env.WHATSAPP_APP_SECRET,
+    whatsappBusinessAccountId: env.WHATSAPP_BUSINESS_ACCOUNT_ID,
+    whatsappVerifyToken: env.WHATSAPP_VERIFY_TOKEN,
   };
 }
 

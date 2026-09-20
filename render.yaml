@@ -49,3 +49,16 @@ services:
         sync: false
       - key: VITE_PAYSTACK_PUBLIC_KEY
         sync: false
+      # WhatsApp Cloud API (Meta). The webhook URL to register with Meta is
+      # https://<your-app>.onrender.com/v1/channel/whatsapp/webhook and must be
+      # configured with the WHATSAPP_VERIFY_TOKEN below.
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_BUSINESS_ACCOUNT_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false

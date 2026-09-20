@@ -54,6 +54,7 @@ const TABLES_TO_TRUNCATE = [
   'commercial_actions',
   'channel_identities',
   'channel_config',
+  'whatsapp_messages',
   'leads',
   'conversation_messages',
   'conversations',

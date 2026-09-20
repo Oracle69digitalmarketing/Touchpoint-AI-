@@ -133,6 +133,10 @@ import {
   getChannelConfigForBusiness,
   upsertChannelConfig,
   listChannelConfigs,
+  getChannelConfigByPhoneNumberId,
+  createWhatsAppMessage,
+  getWhatsAppMessageByWaId,
+  updateWhatsAppMessageByWaId,
   findDefaultAgent,
   getBookingConfig,
   listBookingConfigs,
@@ -148,7 +152,7 @@ import {
   BookingConflictError,
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
-import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendChannelMessage } from './channel-adapter.js';
+import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendWhatsAppMessage, _setWhatsAppHttp as setWhatsAppProviderHttp } from './channel-adapter.js';
 import { initializeOrderPayment, handleProviderWebhook } from './payment-service.js';
 import { _setPaystackHttp as setPaymentProviderHttp } from './payment-provider.js';
 import {
@@ -168,6 +172,13 @@ import {
 // Paystack adapter is provider-neutral and never coupled to order logic.
 export function _setPaystackHttp(http) {
   setPaymentProviderHttp(http);
+}
+
+// TEST SEAM (13D-Batch A): lets the suite substitute the WhatsApp Cloud API
+// transport without a network call. Production always uses the real Meta API
+// via channel-adapter.js.
+export function _setWhatsAppHttp(http) {
+  setWhatsAppProviderHttp(http);
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -334,14 +345,20 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '100kb', verify: rawBodyC
 // General API rate limit. /v1/health is exempted so deployment health checks
 // (Render checks this every few seconds) can never be throttled into a false
 // "unhealthy" restart loop. When mounted at /v1 the health route appears as
-// req.path === '/health' (req.originalUrl === '/v1/health').
+// req.path === '/health' (req.originalUrl === '/v1/health'). The WhatsApp
+// webhook is also exempt: provider delivery bursts (and Meta retries) must not
+// be throttled by the user-facing generic limiter — its security is the
+// X-Hub-Signature-256 check, not an IP counter — and it has its own dedicated
+// high-ceiling limiter below.
+const API_LIMITER_SKIP_PATHS = ['/v1/health', '/v1/channel/whatsapp/webhook'];
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
-  skip: (req) => req.originalUrl === '/v1/health' || req.path === '/health',
+  skip: (req) =>
+    API_LIMITER_SKIP_PATHS.some((p) => req.originalUrl.startsWith(p) || req.path.startsWith(p)),
 });
 
 // Stricter rate limit for AI endpoints (each call consumes Groq quota)
@@ -374,11 +391,25 @@ const publicChatLimiter = rateLimit({
   message: { error: 'Too many chat requests, please slow down.' },
 });
 
+// Dedicated WhatsApp webhook limiter. The user-facing generic limiter above
+// deliberately skips the webhook (Meta delivery bursts and its retries arrive
+// from a small set of provider IPs and must never be throttled mid-burst). Its
+// security is the X-Hub-Signature-256 check, which is verified first inside the
+// handler; this limiter is a high-ceiling cost guard against naive floods only.
+const whatsappWebhookLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many webhook deliveries, please try again later.' },
+});
+
 // Rate limits are skipped during automated tests to keep them deterministic.
 if (!isTest) {
   app.use('/v1', apiLimiter);
   app.use('/v1/ai', aiLimiter);
   app.use('/v1/t', publicChatLimiter);
+  app.use('/v1/channel/whatsapp/webhook', whatsappWebhookLimiter);
   // Brute-force protection targets only credential endpoints.
   app.use('/v1/auth/login', authLimiter);
   app.use('/v1/auth/register', authLimiter);
@@ -5090,6 +5121,8 @@ app.get('/v1/business/channels', requireAuth, asyncHandler(async (req, res) => {
       enabled: c.enabled,
       status: c.status,
       displayName: c.display_name,
+      phoneNumberId: c.phone_number_id || null,
+      providerBusinessAccountId: c.provider_business_account_id || null,
     })),
   });
 }));
@@ -5122,10 +5155,43 @@ app.put('/v1/business/channels/:channel', requireAuth, asyncHandler(async (req, 
     fields.displayName = fields.displayName.trim();
   }
 
+  // Meta phone number id + WABA id are PUBLIC identifiers, not secrets. They
+  // bind the business's WhatsApp channel to the Meta number that maps inbound
+  // webhooks to this tenant. Numeric-only, so a stray access-token-style value
+  // can never be persisted here.
+  const normalizeMetaId = (value, fieldName) => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string' || !/^\d{1,20}$/.test(value.trim())) {
+      return { error: `${fieldName} must be a numeric Meta id` };
+    }
+    return value.trim();
+  };
+  const phoneNumberId = normalizeMetaId(fields.phoneNumberId, 'phoneNumberId');
+  if (phoneNumberId && typeof phoneNumberId === 'object') {
+    return res.status(400).json({ error: 'Validation failed', fields: { phoneNumberId: phoneNumberId.error } });
+  }
+  const providerBusinessAccountId = normalizeMetaId(fields.providerBusinessAccountId, 'providerBusinessAccountId');
+  if (providerBusinessAccountId && typeof providerBusinessAccountId === 'object') {
+    return res.status(400).json({ error: 'Validation failed', fields: { providerBusinessAccountId: providerBusinessAccountId.error } });
+  }
+
   const config = await upsertChannelConfig(req.business.id, channel, {
     enabled: fields.enabled,
     status: fields.status,
     displayName: fields.displayName,
+    phoneNumberId,
+    providerBusinessAccountId,
+  }).catch((err) => {
+    // The unique partial index on phone_number_id means a Meta number can be
+    // bound to exactly one tenant. A claim on an already-bound number must be a
+    // clean client error, never a 500 — and a second tenant can never steal a
+    // number (which would hijack that number's inbound routing).
+    if (err && err.code === '23505') {
+      const conflict = new Error('That Meta phone number id is already bound to another business');
+      conflict.status = 409;
+      throw conflict;
+    }
+    throw err;
   });
 
   res.status(200).json({
@@ -5134,95 +5200,291 @@ app.put('/v1/business/channels/:channel', requireAuth, asyncHandler(async (req, 
       enabled: config.enabled,
       status: config.status,
       displayName: config.display_name,
+      phoneNumberId: config.phone_number_id || null,
+      providerBusinessAccountId: config.provider_business_account_id || null,
     },
   });
 }));
 
-// WHATSAPP CHANNEL (Phase 13A mock boundary)
+// WHATSAPP CLOUD API (real Meta WhatsApp Business webhook)
 //
-// This is the inbound webhook boundary a real WhatsApp Cloud API webhook will
-// verify (signature + verify-token) and forward to. Phase 13A implements only
-// the internal abstraction and a labeled mock: the endpoint is reachable, runs
-// the SAME conversation engine as the web chat, and responds with a mock
-// outbound envelope. No Meta credential exists anywhere, so the endpoint is
-// disabled outside test mode.
-app.post('/v1/channel/whatsapp/inbound', asyncHandler(async (req, res) => {
-  if (!isTest) {
-    return res.status(501).json({ error: 'WhatsApp Cloud API is not configured yet' });
-  }
+// Inbound: Meta webhook -> X-Hub-Signature-256 check (raw body, constant-time)
+// -> resolve business by phone_number_id -> pass through the SAME conversation
+// engine as the web chat -> outbound reply through the same node. Outbound:
+// engine response -> channel-adapter.sendWhatsAppMessage -> WhatsApp Cloud API.
+//
+// Security and correctness posture:
+//   - The payload is never trusted for identity: tenant resolution comes only
+//     from the Meta phone_number_id of the delivery, which is bound to a
+//     channel_config row rooted in a business. Unknown numbers, unknown status
+//     ids, cross-tenant messages, and unmatched statuses are all acknowledged
+//     silently (no existence oracle), never reflected in the response.
+//   - Every inbound message is persisted against its unique Meta wa_message_id
+//     BEFORE the engine runs, so redeliveries are idempotent (no duplicate
+//     messages, leads, funnel events, or AI invocations).
+//   - Message types other than text ARE persisted (media/audio/document/etc.
+//     land in the ledger with their media metadata) but are intentionally not
+//     "handled": nothing is pretended to be answered, and no media pipeline
+//     exists yet.
+//   - Delivery state is driven only by Meta status callbacks; an outbound row
+//     is marked sent only when Meta accepted it, and never claimed otherwise.
+//   - When a webhook is accepted and processed it is ALWAYS acknowledged with
+//   200 so Meta stops redelivering (and can never be starved into an infinite
+//   storm by a persistent processing failure); failures are logged loudly and
+//   recorded on the affected message ledger row.
+//   - No secrets are ever logged; provider errors are reduced to a single
+//   sanitized message.
+const META_STATUS_ORDER = { sent: 0, delivered: 1, read: 2 };
+const META_STATUS_NORMALIZED = { sent: 'sent', delivered: 'delivered', read: 'read', failed: 'failed', deleted: 'failed' };
 
-  const body = req.body || {};
+function verifyWhatsAppSignature(rawBody, signature) {
+  if (!rawBody || !Buffer.isBuffer(rawBody) || typeof signature !== 'string' || !signature) return false;
+  if (!signature.startsWith('sha256=')) return false;
+  const expected = crypto.createHmac('sha256', config.whatsappAppSecret).update(rawBody).digest('hex');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature.slice('sha256='.length), 'hex');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 
-  // Optional handshake verification, mirroring Meta's hub verification. Only
-  // active when the deployment supplies WHATSAPP_VERIFY_TOKEN — Phase 13A tests
-  // never rely on it, so the mock stays meaningful without any credential.
-  if (process.env.WHATSAPP_VERIFY_TOKEN) {
-    const queryToken = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
-    if (queryToken !== process.env.WHATSAPP_VERIFY_TOKEN) {
-      return res.status(403).json({ error: 'Invalid verification token' });
+function safeProviderError(err) {
+  if (!err) return null;
+  const message = typeof err.message === 'string' ? err.message : String(err);
+  return message.slice(0, 300);
+}
+
+function whatsappMediaMetadata(message) {
+  for (const key of ['image', 'video', 'audio', 'document', 'sticker', 'location', 'contacts', 'button', 'interactive', 'reaction']) {
+    if (message[key] && typeof message[key] === 'object') {
+      const m = message[key];
+      return {
+        attachment: key,
+        id: typeof m.id === 'string' ? m.id : null,
+        mimeType: typeof m.mime_type === 'string' ? m.mime_type : null,
+        caption: typeof m.caption === 'string' ? m.caption.slice(0, 300) : null,
+      };
     }
   }
+  return { attachment: message.type || 'unknown', raw: true };
+}
 
-  const businessId = typeof body.businessId === 'string' ? body.businessId.trim() : '';
-  if (!businessId) return res.status(400).json({ error: 'businessId is required' });
+// Resolves the tenant + conversation for an inbound Meta message, persists the
+// inbound ledger row (idempotently), and hands the text to the shared engine.
+// Never throws for provider-side conditions: the webhook always acknowledges.
+async function processWhatsAppInbound({ channelConfig, entryId, message }) {
+  const waMessageId = typeof message.id === 'string' ? message.id : null;
+  const from = typeof message.from === 'string' ? message.from : null;
+  if (!waMessageId || !from) return;
+
+  const businessId = channelConfig.business_id;
   const business = await getBusinessById(businessId);
-  if (!business) return res.status(404).json({ error: 'Business not found' });
+  if (!business) return;
 
-  const externalId = typeof body.from === 'string' ? body.from.trim() : '';
-  if (!externalId) return res.status(400).json({ error: 'from is required' });
-  if (externalId.length > 60) return res.status(400).json({ error: 'from must be 60 characters or fewer' });
+  const messageType = typeof message.type === 'string' ? message.type : 'text';
+  const text = messageType === 'text' && message.text && typeof message.text.body === 'string'
+    ? message.text.body.trim()
+    : '';
+  const media = messageType === 'text' ? {} : whatsappMediaMetadata(message);
+  // Only processable size-wise; oversized text is stored for audit only.
+  const willProcess = messageType === 'text' && !!text && text.length <= 2000;
 
-  const message = typeof body.message === 'string' ? body.message.trim() : '';
-  if (!message || message.length > 2000) {
-    return res.status(400).json({ error: 'message must be 1-2000 characters' });
-  }
-
-  const channel = CHANNELS.WHATSAPP;
-
-  const identity = await getChannelIdentity(businessId, channel, externalId);
+  // Resolve/create the conversation only for messages that will actually be
+  // answered, so audit-only rows (media, oversized) never create stray empty
+  // conversations or channel identities.
+  const agent = willProcess ? await findDefaultAgent(businessId) : null;
+  const identity = willProcess && agent
+    ? await getChannelIdentity(businessId, CHANNELS.WHATSAPP, from)
+    : null;
   let conversation = identity ? await getConversationById(identity.conversation_id) : null;
-
-  const agent = await findDefaultAgent(businessId);
-  if (!agent) return res.status(409).json({ error: 'Business has no active agent to handle this channel' });
-
-  if (!conversation) {
+  if (willProcess && agent && !conversation) {
     conversation = await createConversation({
       businessId,
       agentId: agent.id,
-      targetLanguage: typeof body.targetLanguage === 'string' ? body.targetLanguage.trim().toLowerCase().slice(0, 8) : 'en',
-      channel: channel,
+      targetLanguage: 'en',
+      channel: CHANNELS.WHATSAPP,
     });
     await createChannelIdentity({
       businessId,
-      channel: channel,
-      externalId,
+      channel: CHANNELS.WHATSAPP,
+      externalId: from,
       conversationId: conversation.id,
     });
   }
 
-  const response = await runConversationEngine({
-    business,
-    agent,
-    conversation,
-    message,
-    targetLanguage: conversation.target_language || 'en',
+  const inbound = await createWhatsAppMessage({
+    businessId,
+    conversationId: conversation ? conversation.id : null,
+    direction: 'inbound',
+    waMessageId,
+    status: 'received',
+    messageType,
+    customerPhone: from,
+    body: text || null,
+    media,
+    payload: { entryId, timestamp: message.timestamp || null },
+  });
+  if (!inbound) return; // wa_message_id already recorded: duplicate delivery, no-op
+  await recordWebhookEvent({
+    eventId: `whatsapp:msg:${businessId}:${waMessageId}`,
+    eventType: 'whatsapp.message',
+    businessId,
   });
 
-  const outbound = sendChannelMessage({
-    channel: channel,
-    destination: externalId,
-    text: response.messages && response.messages.length > 0
+  // Media/unsupported types and oversized text are persisted but never answered.
+  if (!willProcess) return;
+  if (!conversation || !agent) return; // nothing can be addressed back on this delivery
+
+  let replyText = null;
+  try {
+    const response = await runConversationEngine({
+      business,
+      agent,
+      conversation,
+      message: text,
+      targetLanguage: conversation.target_language || 'en',
+    });
+    replyText = response.messages && response.messages.length > 0
       ? response.messages[response.messages.length - 1].text
-      : response.conversationId,
-  });
+      : null;
+  } catch (err) {
+    // Logged loudly; the customer is not answered on this delivery and the
+    // inbound ledger row already records that this message was received.
+    console.error(`[whatsapp] engine processing failed business=${businessId} waMessageId=${waMessageId}: ${safeProviderError(err)}`);
+    return;
+  }
+  if (!replyText || !replyText.trim()) return;
 
-  res.status(200).json({
-    conversationId: conversation.id,
-    channel: channel,
-    agent: response.agent,
-    outbound,
-    messages: response.messages,
-  });
+  try {
+    const { providerMessageId } = await sendWhatsAppMessage({
+      accessToken: config.whatsappAccessToken,
+      phoneNumberId: channelConfig.phone_number_id || config.whatsappPhoneNumberId,
+      to: from,
+      text: replyText,
+    });
+    await createWhatsAppMessage({
+      businessId,
+      conversationId: conversation.id,
+      direction: 'outbound',
+      waMessageId: providerMessageId,
+      status: 'sent', // only ever set on Meta acceptance
+      messageType: 'text',
+      customerPhone: from,
+      body: replyText,
+      payload: { inReplyTo: waMessageId },
+    });
+  } catch (err) {
+    await createWhatsAppMessage({
+      businessId,
+      conversationId: conversation.id,
+      direction: 'outbound',
+      status: 'failed',
+      messageType: 'text',
+      customerPhone: from,
+      body: replyText,
+      providerError: safeProviderError(err),
+      payload: { inReplyTo: waMessageId },
+    });
+  }
+}
+
+// Applies a delivered/read/sent/failed callback to an outbound (or inbound)
+// message id. Only that business's own rows are touched; status can only move
+// forward (sent -> delivered -> read); failed is accepted as final.
+async function processWhatsAppStatus({ channelConfig, entryId, status }) {
+  const waMessageId = typeof status.id === 'string' ? status.id : null;
+  const providerStatus = typeof status.status === 'string' ? status.status : null;
+  if (!waMessageId || !providerStatus) return;
+  const normalized = META_STATUS_NORMALIZED[providerStatus];
+  if (!normalized) return; // unknown provider status: never invent state
+
+  const businessId = channelConfig.business_id;
+  const existing = await getWhatsAppMessageByWaId(waMessageId);
+  if (!existing || existing.business_id !== businessId) return; // unknown/cross-tenant, no-op
+
+  const error = Array.isArray(status.errors) && status.errors[0]
+    ? { code: status.errors[0].code || null, title: status.errors[0].title || null, message: (status.errors[0].message || status.errors[0].details || '').slice(0, 300) }
+    : null;
+
+  let changed = false;
+  if (normalized === 'failed') {
+    changed = (await updateWhatsAppMessageByWaId(waMessageId, {
+      status: 'failed',
+      providerError: error ? JSON.stringify(error) : null,
+    })) !== null;
+  } else {
+    const currentRank = META_STATUS_ORDER[existing.status];
+    if (META_STATUS_ORDER[normalized] > (currentRank === undefined ? -1 : currentRank)) {
+      changed = (await updateWhatsAppMessageByWaId(waMessageId, { status: normalized })) !== null;
+    }
+  }
+  if (changed) {
+    await recordWebhookEvent({
+      eventId: `whatsapp:status:${businessId}:${waMessageId}:${providerStatus}`,
+      eventType: 'whatsapp.status',
+      businessId,
+    });
+  }
+}
+
+async function ingestWhatsAppDelivery(body) {
+  let processed = 0;
+  if (!body || !Array.isArray(body.entry)) return { received: true, processed };
+  for (const entry of body.entry) {
+    if (!entry || !Array.isArray(entry.changes)) continue;
+    for (const change of entry.changes) {
+      if (!change || !change.value || typeof change.value !== 'object') continue;
+      const value = change.value;
+      const phoneNumberId = value.metadata && typeof value.metadata.phone_number_id === 'string'
+        ? value.metadata.phone_number_id
+        : null;
+      if (!phoneNumberId) continue;
+      // Identity comes ONLY from the Meta phone number id. Anything else in the
+      // payload (business id-like fields, senders) is never trusted for tenant
+      // resolution.
+      const channelConfig = await getChannelConfigByPhoneNumberId(phoneNumberId);
+      if (!channelConfig) continue; // unknown phone number: acknowledge silently
+      if (Array.isArray(value.messages)) {
+        for (const message of value.messages) {
+          await processWhatsAppInbound({ channelConfig, entryId: entry.id || null, message });
+          processed += 1;
+        }
+      }
+      if (Array.isArray(value.statuses)) {
+        for (const status of value.statuses) {
+          await processWhatsAppStatus({ channelConfig, entryId: entry.id || null, status });
+          processed += 1;
+        }
+      }
+    }
+  }
+  return { received: true, processed };
+}
+
+// GET: Meta's hub verification handshake. Answers 200 + the raw challenge only
+// when mode=subscribe AND the verify token matches; the token lives in the
+// deployment environment and is echoed back to Meta exactly as configured.
+app.get('/v1/channel/whatsapp/webhook', (req, res) => {
+  const mode = typeof req.query['hub.mode'] === 'string' ? req.query['hub.mode'] : '';
+  const token = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
+  const challenge = typeof req.query['hub.challenge'] === 'string' ? req.query['hub.challenge'] : '';
+  if (mode === 'subscribe' && token && config.whatsappVerifyToken && token === config.whatsappVerifyToken) {
+    if (!challenge) return res.status(403).json({ error: 'Invalid verification challenge' });
+    return res.type('text/plain').send(challenge);
+  }
+  return res.status(403).json({ error: 'Invalid verification request' });
+});
+
+app.post('/v1/channel/whatsapp/webhook', asyncHandler(async (req, res) => {
+  // Authenticity of the whole payload is established BEFORE anything is read:
+  // X-Hub-Signature-256 = HMAC-SHA256(app secret, raw body), constant-time.
+  // No WHATSAPP_APP_SECRET configured => reject (never process unsigned data).
+  const signature = req.headers['x-hub-signature-256'];
+  if (!config.whatsappAppSecret || !verifyWhatsAppSignature(req.rawBody, signature)) {
+    return res.status(401).json({ error: 'Invalid webhook signature' });
+  }
+  const body = typeof req.body === 'object' && req.body !== null ? req.body : {};
+  const result = await ingestWhatsAppDelivery(body);
+  res.status(200).json(result);
 }));
 
 /**

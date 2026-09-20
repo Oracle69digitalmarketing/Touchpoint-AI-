@@ -241,8 +241,11 @@ CREATE TABLE IF NOT EXISTS channel_identities (
 );
 
 -- Business-level channel configuration. PUBLIC settings only (enabled, status,
--- display name). Provider credentials/secrets belong to the deployment
--- environment, never to source code, seeds, logs, frontend, or this table.
+-- display name, Meta phone number id). Provider credentials/secrets belong to
+-- the deployment environment, never to source code, seeds, logs, frontend, or
+-- this table. `phone_number_id` binds the business's WhatsApp channel to a Meta
+-- phone number id; the unique partial index makes inbound resolution
+-- unambiguous (one Meta number -> exactly one tenant).
 CREATE TABLE IF NOT EXISTS channel_config (
   id           TEXT PRIMARY KEY,
   business_id  TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
@@ -250,10 +253,45 @@ CREATE TABLE IF NOT EXISTS channel_config (
   enabled      BOOLEAN NOT NULL DEFAULT FALSE,
   status       TEXT NOT NULL DEFAULT 'not_configured',
   display_name TEXT NOT NULL DEFAULT 'WhatsApp',
+  phone_number_id TEXT,
+  provider_business_account_id TEXT,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (business_id, channel)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_config_phone_number_id
+  ON channel_config(phone_number_id) WHERE phone_number_id IS NOT NULL;
+
+-- WhatsApp message ledger (real Meta Cloud API channel). Inbound messages are
+-- persisted with their Meta wa_message_id so duplicate webhook deliveries are
+-- idempotent; outbound messages carry the normalized provider status
+-- (queued -> sent -> delivered -> read, or failed) which is only ever advanced
+-- by Meta status callbacks. message_type + reserved media JSONB let future
+-- media land in the ledger safely; unsupported types are stored, never
+-- pretended to be handled.
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+  id               TEXT PRIMARY KEY,
+  business_id      TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  conversation_id  TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  direction        TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+  wa_message_id    TEXT,
+  status           TEXT NOT NULL DEFAULT 'queued',
+  message_type     TEXT NOT NULL DEFAULT 'text',
+  customer_phone   TEXT,
+  body             TEXT,
+  media            JSONB NOT NULL DEFAULT '{}',
+  provider_error   TEXT,
+  payload          JSONB NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_messages_wa_message_id
+  ON whatsapp_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_business ON whatsapp_messages(business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_conversation ON whatsapp_messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_status ON whatsapp_messages(business_id, status, created_at);
 
 -- Payment intents (Phase 13B): the provider-neutral settlement ledger. At most
 -- one live 'pending' intent per order (partial unique index), and a provider

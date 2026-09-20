@@ -1424,40 +1424,158 @@ export async function createChannelIdentity({ businessId, channel, externalId, c
 
 export async function getChannelConfigForBusiness(businessId, channel) {
   const res = await pool.query(
-    `SELECT id, business_id, channel, enabled, status, display_name, created_at, updated_at
+    `SELECT id, business_id, channel, enabled, status, display_name,
+            phone_number_id, provider_business_account_id, created_at, updated_at
      FROM channel_config WHERE business_id = $1 AND channel = $2`,
     [businessId, channel]
   );
   return res.rows[0] || null;
 }
 
-export async function upsertChannelConfig(businessId, channel, { enabled = null, status = null, displayName = null } = {}) {
+export async function getChannelConfigByPhoneNumberId(phoneNumberId) {
+  if (!phoneNumberId) return null;
+  const res = await pool.query(
+    `SELECT id, business_id, channel, enabled, status, display_name,
+            phone_number_id, provider_business_account_id, created_at, updated_at
+     FROM channel_config WHERE phone_number_id = $1`,
+    [phoneNumberId]
+  );
+  return res.rows[0] || null;
+}
+
+export async function upsertChannelConfig(businessId, channel, {
+  enabled = null, status = null, displayName = null, phoneNumberId = null, providerBusinessAccountId = null,
+} = {}) {
   const existing = await getChannelConfigForBusiness(businessId, channel);
   const values = {
     enabled: enabled === null || enabled === undefined ? (existing ? existing.enabled : false) : !!enabled,
     status: status ?? (existing ? existing.status : 'not_configured'),
     displayName: displayName ?? (existing ? existing.display_name : 'WhatsApp'),
+    phoneNumberId: phoneNumberId === null || phoneNumberId === undefined ? (existing ? existing.phone_number_id : null) : phoneNumberId,
+    providerBusinessAccountId:
+      providerBusinessAccountId === null || providerBusinessAccountId === undefined
+        ? (existing ? existing.provider_business_account_id : null)
+        : providerBusinessAccountId,
   };
   await pool.query(
-    `INSERT INTO channel_config (id, business_id, channel, enabled, status, display_name)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO channel_config (id, business_id, channel, enabled, status, display_name, phone_number_id, provider_business_account_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (business_id, channel) DO UPDATE SET
        enabled = EXCLUDED.enabled,
        status = EXCLUDED.status,
        display_name = EXCLUDED.display_name,
+       phone_number_id = EXCLUDED.phone_number_id,
+       provider_business_account_id = EXCLUDED.provider_business_account_id,
        updated_at = CURRENT_TIMESTAMP`,
-    [crypto.randomUUID(), businessId, channel, values.enabled, values.status, values.displayName]
+    [
+      crypto.randomUUID(), businessId, channel, values.enabled, values.status, values.displayName,
+      values.phoneNumberId, values.providerBusinessAccountId,
+    ]
   );
   return getChannelConfigForBusiness(businessId, channel);
 }
 
 export async function listChannelConfigs(businessId) {
   const res = await pool.query(
-    `SELECT id, business_id, channel, enabled, status, display_name, created_at, updated_at
+    `SELECT id, business_id, channel, enabled, status, display_name,
+            phone_number_id, provider_business_account_id, created_at, updated_at
      FROM channel_config WHERE business_id = $1 ORDER BY channel`,
     [businessId]
   );
   return res.rows;
+}
+
+const WHATSAPP_MESSAGE_COLUMNS = `
+  id, business_id, conversation_id, direction, wa_message_id, status,
+  message_type, customer_phone, body, media, provider_error, payload,
+  created_at, updated_at
+`;
+
+const mapWhatsAppMessage = (row) =>
+  row
+    ? {
+        ...row,
+        media: row.media || {},
+        payload: row.payload || {},
+      }
+    : null;
+
+export async function createWhatsAppMessage({
+  businessId, conversationId, direction, waMessageId, status = 'queued', messageType = 'text',
+  customerPhone, body = null, media = {}, providerError = null, payload = {},
+}) {
+  const id = crypto.randomUUID();
+  const res = await pool.query(
+    `INSERT INTO whatsapp_messages
+       (id, business_id, conversation_id, direction, wa_message_id, status, message_type,
+        customer_phone, body, media, provider_error, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING
+     RETURNING ${WHATSAPP_MESSAGE_COLUMNS}`,
+    [
+      id, businessId, conversationId, direction, waMessageId || null, status, messageType,
+      customerPhone, body, JSON.stringify(media || {}), providerError, JSON.stringify(payload || {}),
+    ]
+  );
+  return mapWhatsAppMessage(res.rows[0] || null);
+}
+
+export async function getWhatsAppMessageById(id) {
+  const res = await pool.query(
+    `SELECT ${WHATSAPP_MESSAGE_COLUMNS} FROM whatsapp_messages WHERE id = $1`,
+    [id]
+  );
+  return mapWhatsAppMessage(res.rows[0] || null);
+}
+
+export async function getWhatsAppMessageByWaId(waMessageId) {
+  if (!waMessageId) return null;
+  const res = await pool.query(
+    `SELECT ${WHATSAPP_MESSAGE_COLUMNS} FROM whatsapp_messages WHERE wa_message_id = $1`,
+    [waMessageId]
+  );
+  return mapWhatsAppMessage(res.rows[0] || null);
+}
+
+export async function updateWhatsAppMessageByWaId(waMessageId, { status = null, providerError = null, payload = null }) {
+  if (!waMessageId) return null;
+  const parts = [];
+  const params = [waMessageId];
+  if (status) {
+    params.push(status);
+    parts.push(`status = $${params.length}`);
+  }
+  if (providerError !== null && providerError !== undefined) {
+    params.push(providerError);
+    parts.push(`provider_error = $${params.length}`);
+  }
+  if (payload !== null && payload !== undefined) {
+    params.push(JSON.stringify(payload));
+    parts.push(`payload = $${params.length}`);
+  }
+  if (parts.length === 0) return getWhatsAppMessageByWaId(waMessageId);
+  parts.push('updated_at = CURRENT_TIMESTAMP');
+  const res = await pool.query(
+    `UPDATE whatsapp_messages SET ${parts.join(', ')} WHERE wa_message_id = $1 RETURNING ${WHATSAPP_MESSAGE_COLUMNS}`,
+    params
+  );
+  const row = res.rows[0] || null;
+  return mapWhatsAppMessage(row);
+}
+
+export async function listWhatsAppMessages(conversationId, { limit = 100, direction = null } = {}) {
+  const params = [conversationId, limit];
+  let filter = 'conversation_id = $1';
+  if (direction) {
+    params.splice(1, 0, direction);
+    filter = 'conversation_id = $1 AND direction = $2';
+  }
+  const res = await pool.query(
+    `SELECT ${WHATSAPP_MESSAGE_COLUMNS} FROM whatsapp_messages WHERE ${filter}
+     ORDER BY created_at, id LIMIT $${params.length}`,
+    params
+  );
+  return res.rows.map(mapWhatsAppMessage);
 }
 
 export async function findDefaultAgent(businessId) {
