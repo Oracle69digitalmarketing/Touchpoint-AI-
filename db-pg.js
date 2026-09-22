@@ -823,7 +823,8 @@ export async function updateConversationSalesState(conversationId, state) {
 const LEAD_COLUMNS = `
   l.id, l.business_id, l.touchpoint_id, l.conversation_id, l.agent_id,
   l.name, l.phone, l.email, l.intent, l.qualification_score,
-  l.qualification_status, l.source, l.notified, l.created_at, l.updated_at,
+  l.qualification_status, l.source, l.notified, l.crm_status, l.assigned_user_id,
+  l.created_at, l.updated_at,
   tp.name AS touchpoint_name, a.name AS agent_name
 `;
 
@@ -918,6 +919,252 @@ export async function updateLead(businessId, id, data) {
 }
 
 /**
+ * PHASE 13F CRM PERSISTENCE
+ *
+ * Operator-controlled lead CRM state, stored separately from the AI-driven
+ * qualification state (qualification_status/score) and the sales conversation
+ * stage. Tenant ownership on every operation is anchored to the authenticated
+ * business id supplied by the caller (from the session, never the client body).
+ */
+
+export const CRM_STATUSES = [
+  'new', 'contacted', 'qualified', 'opportunity',
+  'customer', 'unqualified', 'lost', 'do_not_contact',
+];
+
+export const CRM_NOTE_SOURCES = ['human', 'ai'];
+
+/**
+ * Sets a lead's operator-controlled CRM status. Returns the updated lead, or
+ * null when the lead does not belong to the business. Throws when the status
+ * is not one of the approved values.
+ */
+export async function setLeadCrmStatus(businessId, leadId, status) {
+  if (!CRM_STATUSES.includes(status)) {
+    throw new Error(`crmStatus must be one of: ${CRM_STATUSES.join(', ')}`);
+  }
+  const res = await pool.query(
+    `UPDATE leads SET crm_status = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE business_id = $2 AND id = $3`,
+    [status, businessId, leadId]
+  );
+  if (res.rowCount === 0) return null;
+  return getLeadById(businessId, leadId);
+}
+
+/**
+ * Assigns (or, with a null userId, unassigns) a workspace user to a lead.
+ * The assigned user MUST belong to the authenticated business; a user from any
+ * other business is rejected. The caller must always supply the business id
+ * from the authenticated session — a client-supplied business id is never
+ * trusted. Returns the updated lead, or null when the lead does not belong to
+ * the business.
+ */
+export async function assignLeadUser(businessId, leadId, userId) {
+  if (userId !== null && userId !== undefined) {
+    const user = await pool.query(
+      'SELECT 1 FROM users WHERE id = $1 AND business_id = $2',
+      [userId, businessId]
+    );
+    if (user.rowCount === 0) {
+      throw new Error('The assigned user does not belong to this business');
+    }
+  }
+  const res = await pool.query(
+    `UPDATE leads SET assigned_user_id = $1, updated_at = CURRENT_TIMESTAMP
+     WHERE business_id = $2 AND id = $3`,
+    [userId === undefined ? null : userId, businessId, leadId]
+  );
+  if (res.rowCount === 0) return null;
+  return getLeadById(businessId, leadId);
+}
+
+/**
+ * Creates a CRM note for a lead. Tenant ownership is checked on BOTH the lead
+ * and the optional author: the lead must belong to the business and, when an
+ * author is supplied, that user must belong to the same business. `source`
+ * distinguishes human-authored notes from AI notes; nothing generates AI notes
+ * in this phase, but the model is ready for them.
+ */
+export async function createCrmNote({ businessId, leadId, authorUserId = null, body, source }) {
+  if (typeof body !== 'string' || !body.trim()) {
+    throw new Error('Note body must be a non-empty string');
+  }
+  if (!CRM_NOTE_SOURCES.includes(source)) {
+    throw new Error(`Note source must be one of: ${CRM_NOTE_SOURCES.join(', ')}`);
+  }
+  const lead = await pool.query(
+    'SELECT 1 FROM leads WHERE id = $1 AND business_id = $2',
+    [leadId, businessId]
+  );
+  if (lead.rowCount === 0) {
+    throw new Error('The lead does not belong to this business');
+  }
+  if (authorUserId !== null && authorUserId !== undefined) {
+    const author = await pool.query(
+      'SELECT 1 FROM users WHERE id = $1 AND business_id = $2',
+      [authorUserId, businessId]
+    );
+    if (author.rowCount === 0) {
+      throw new Error('The note author does not belong to this business');
+    }
+  }
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO crm_notes (id, business_id, lead_id, author_user_id, body, source)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, businessId, leadId, authorUserId === undefined ? null : authorUserId, body, source]
+  );
+  const res = await pool.query(
+    'SELECT id, business_id, lead_id, author_user_id, body, source, created_at, updated_at FROM crm_notes WHERE id = $1',
+    [id]
+  );
+  return res.rows[0];
+}
+
+/**
+ * Lists a lead's CRM notes, newest first. Scoped to the business: a lead from
+ * another business yields an empty result, never leaked rows.
+ */
+export async function listCrmNotes(businessId, leadId) {
+  const res = await pool.query(
+    `SELECT id, business_id, lead_id, author_user_id, body, source, created_at, updated_at
+     FROM crm_notes
+     WHERE business_id = $1 AND lead_id = $2
+     ORDER BY created_at DESC`,
+    [businessId, leadId]
+  );
+  return res.rows;
+}
+
+/**
+ * PHASE 13F CRM READ MODELS (derived, read-only)
+ *
+ * Enriched lead rows: the persisted lead joined to its 1:1 conversation's
+ * sales intelligence. Conversation count, first/last interaction and every
+ * intelligence field are derived on read — nothing is denormalized onto
+ * `leads`.
+ */
+
+const CRM_LEAD_COLUMNS = `
+  l.id, l.business_id, l.touchpoint_id, l.conversation_id, l.agent_id,
+  l.name, l.phone, l.email, l.intent, l.qualification_score,
+  l.qualification_status, l.source, l.notified, l.crm_status, l.assigned_user_id,
+  l.created_at, l.updated_at,
+  tp.name AS touchpoint_name, a.name AS agent_name,
+  c.stage AS sales_stage, c.intent AS conversation_intent, c.customer_need,
+  c.buying_signal, c.objection, c.next_best_action, c.channel, c.customer_name,
+  p.id AS recommended_product_id, p.name AS recommended_product_name,
+  u.name AS assigned_user_name,
+  CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END AS conversation_count,
+  GREATEST(
+    l.updated_at,
+    c.updated_at,
+    (SELECT MAX(f.created_at) FROM funnel_events f
+      WHERE f.business_id = l.business_id
+        AND (f.lead_id = l.id OR (f.conversation_id = l.conversation_id AND f.conversation_id IS NOT NULL)))
+  ) AS last_interaction
+`;
+
+const CRM_LEAD_JOINS = `
+  FROM leads l
+  LEFT JOIN touchpoints tp ON tp.id = l.touchpoint_id
+  LEFT JOIN agents a ON a.id = l.agent_id
+  LEFT JOIN conversations c ON c.id = l.conversation_id
+  LEFT JOIN products p ON p.id = c.recommended_product_id
+  LEFT JOIN users u ON u.id = l.assigned_user_id
+`;
+
+/**
+ * Builds the tenant-scoped WHERE clause for CRM lead reads. Filter values are
+ * validated by the caller (the route layer) before reaching this function;
+ * unknown or absent filters contribute nothing. `search` wildcards are escaped
+ * so user input can only match literally.
+ */
+function crmLeadWhereClause(businessId, { crmStatus, assignedUserId, qualificationStatus, source, search } = {}) {
+  const conditions = ['l.business_id = $1'];
+  const params = [businessId];
+
+  if (crmStatus) {
+    params.push(crmStatus);
+    conditions.push(`l.crm_status = $${params.length}`);
+  }
+  if (assignedUserId) {
+    params.push(assignedUserId);
+    conditions.push(`l.assigned_user_id = $${params.length}`);
+  }
+  if (qualificationStatus) {
+    params.push(qualificationStatus);
+    conditions.push(`l.qualification_status = $${params.length}`);
+  }
+  if (source) {
+    params.push(source);
+    conditions.push(`l.source = $${params.length}`);
+  }
+  if (search) {
+    const escaped = search.replace(/[\\%_]/g, (m) => `\\${m}`);
+    params.push(`%${escaped}%`);
+    const idx = params.length;
+    conditions.push(`(l.name ILIKE $${idx} OR l.phone ILIKE $${idx} OR l.email ILIKE $${idx})`);
+  }
+
+  return { clause: conditions.join(' AND '), params };
+}
+
+export async function listCrmLeads(businessId, { crmStatus, assignedUserId, qualificationStatus, source, search, limit = 50, offset = 0 } = {}) {
+  const { clause, params } = crmLeadWhereClause(businessId, { crmStatus, assignedUserId, qualificationStatus, source, search });
+  params.push(limit, offset);
+  const res = await pool.query(`
+    SELECT ${CRM_LEAD_COLUMNS} ${CRM_LEAD_JOINS}
+    WHERE ${clause}
+    ORDER BY l.updated_at DESC, l.id ASC
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `, params);
+  return res.rows;
+}
+
+export async function countCrmLeads(businessId, { crmStatus, assignedUserId, qualificationStatus, source, search } = {}) {
+  const { clause, params } = crmLeadWhereClause(businessId, { crmStatus, assignedUserId, qualificationStatus, source, search });
+  const res = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM leads l WHERE ${clause}`,
+    params
+  );
+  return res.rows[0].n;
+}
+
+export async function getCrmLead(businessId, id) {
+  const res = await pool.query(`
+    SELECT ${CRM_LEAD_COLUMNS} ${CRM_LEAD_JOINS}
+    WHERE l.business_id = $1 AND l.id = $2
+  `, [businessId, id]);
+  return res.rows[0] || null;
+}
+
+/**
+ * CRM activity timeline for one lead: events anchored directly by
+ * `funnel_events.lead_id` combined with events attached through the lead's
+ * 1:1 conversation. The OR is a set union, so an event carrying BOTH lead_id
+ * and conversation_id is returned exactly once. Chronological (oldest first).
+ * Read-only: never mutates funnel_events.
+ */
+export async function listLeadActivity(businessId, leadId, conversationId = null) {
+  const params = [businessId, leadId];
+  let convoClause = '';
+  if (conversationId) {
+    params.push(conversationId);
+    convoClause = ` OR (fe.conversation_id = $${params.length} AND fe.conversation_id IS NOT NULL)`;
+  }
+  const res = await pool.query(`
+    SELECT fe.id, fe.business_id, fe.conversation_id, fe.order_id, fe.lead_id,
+           fe.event_type, fe.meta, fe.created_at
+    FROM funnel_events fe
+    WHERE fe.business_id = $1 AND (fe.lead_id = $2${convoClause})
+    ORDER BY fe.created_at ASC, fe.id ASC
+  `, params);
+  return res.rows;
+}
+
+/**
  * LEAD NOTIFICATION STORAGE
  */
 
@@ -994,15 +1241,28 @@ export async function markLeadNotificationsRead(businessId) {
  * application actually observed the transition — never fabricated from the
  * customer's wishes.
  */
-export async function createFunnelEvent({ businessId, conversationId = null, eventType, meta = null }) {
+export async function createFunnelEvent({ businessId, conversationId = null, leadId = null, eventType, meta = null }) {
+  // The optional lead anchor is tenant-checked when supplied: a lead can only
+  // be attached to a funnel event for its own business. When leadId is omitted
+  // the behaviour is exactly as before, so existing emitters are unaffected.
+  if (leadId !== null && leadId !== undefined) {
+    const lead = await pool.query(
+      'SELECT 1 FROM leads WHERE id = $1 AND business_id = $2',
+      [leadId, businessId]
+    );
+    if (lead.rowCount === 0) {
+      throw new Error('The lead does not belong to this business');
+    }
+  }
   const id = crypto.randomUUID();
   await pool.query(`
-    INSERT INTO funnel_events (id, business_id, conversation_id, event_type, meta)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO funnel_events (id, business_id, conversation_id, lead_id, event_type, meta)
+    VALUES ($1, $2, $3, $4, $5, $6)
   `, [
     id,
     businessId,
     conversationId,
+    leadId === undefined ? null : leadId,
     eventType,
     meta && typeof meta === 'object' ? JSON.stringify(meta) : '{}',
   ]);

@@ -1,8 +1,9 @@
 
 import React, { useState } from 'react';
-import { MessageSquare, ShieldCheck, FileText, Bot, Loader2, Globe, Phone, Mail, Target, TrendingUp } from 'lucide-react';
-import { Conversation, Agent, Lead, LeadQualificationStatus, SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES } from '../types';
+import { MessageSquare, ShieldCheck, Bot, Loader2, Globe, Phone, Mail, Target, TrendingUp, ExternalLink, User } from 'lucide-react';
+import { Conversation, Agent, Lead, LeadQualificationStatus, CRM_STATUS_LABELS, SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES } from '../types';
 import { simulateAgentConversation } from '../services/ai';
+import { crmStatusStyles } from './LeadPipeline';
 
 interface Props {
   conversations: Conversation[];
@@ -10,6 +11,7 @@ interface Props {
   agents: Agent[];
   currentLanguage: string;
   currentCurrency: string;
+  onOpenLead: (leadId: string) => void;
 }
 
 const statusStyles: Record<LeadQualificationStatus, { badge: string; dot: string; label: string }> = {
@@ -18,7 +20,7 @@ const statusStyles: Record<LeadQualificationStatus, { badge: string; dot: string
   unqualified: { badge: 'bg-slate-50 text-slate-400 border-slate-100', dot: 'bg-slate-300', label: 'Unqualified' },
 };
 
-const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, currentLanguage, currentCurrency }) => {
+const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, currentLanguage, currentCurrency, onOpenLead }) => {
   const [selectedConvo, setSelectedConvo] = useState<string | null>(null);
   const [testAgentId, setTestAgentId] = useState(agents[0]?.id || '');
   const [chatLog, setChatLog] = useState<{role: 'user' | 'model', text: string}[]>([]);
@@ -173,14 +175,25 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
              ) : (
                leads.map(l => {
                  const s = statusStyles[l.qualificationStatus] || statusStyles.pending;
+                 const cr = crmStatusStyles[l.crmStatus] || crmStatusStyles.new;
                  return (
-                   <div key={l.id} className="p-4 border border-slate-50 bg-slate-50/50 rounded-2xl hover:bg-white hover:border-indigo-100 hover:shadow-lg transition-all cursor-pointer group">
+                   <div key={l.id} onClick={() => onOpenLead(l.id)} className="p-4 border border-slate-50 bg-slate-50/50 rounded-2xl hover:bg-white hover:border-indigo-100 hover:shadow-lg transition-all cursor-pointer group">
                       <div className="flex justify-between items-start mb-2 gap-2">
                         <p className="text-sm font-bold text-slate-900 truncate">{l.name || 'Anonymous lead'}</p>
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-tighter flex items-center gap-1 shrink-0 ${s.badge}`}>
                           <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`}></span>
                           {s.label}
                         </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5 mb-2">
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-tighter ${cr.badge}`}>
+                          {CRM_STATUS_LABELS[l.crmStatus] || l.crmStatus}
+                        </span>
+                        {l.assignedUser && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold text-slate-500 bg-white border border-slate-100 rounded-full px-2 py-0.5">
+                            <User size={10} className="text-emerald-400" /> {l.assignedUser.name}
+                          </span>
+                        )}
                       </div>
                       {(l.phone || l.email) && (
                         <div className="flex flex-wrap gap-2 mb-2">
@@ -215,9 +228,9 @@ const ConversationHub: React.FC<Props> = ({ conversations, leads, agents, curren
                             {l.touchpointName || '—'} {l.agentName ? `· ${l.agentName}` : ''}
                           </span>
                         ) : <span />}
-                        <button className="text-[10px] font-bold text-indigo-600 flex items-center gap-1 group-hover:translate-x-1 transition-transform">
-                          <FileText size={12}/> Generate Smart Proposal
-                        </button>
+                        <span className="text-[10px] font-bold text-indigo-600 flex items-center gap-1 group-hover:translate-x-1 transition-transform" onClick={() => onOpenLead(l.id)}>
+                          <ExternalLink size={12}/> Open CRM
+                        </span>
                       </div>
                    </div>
                  );

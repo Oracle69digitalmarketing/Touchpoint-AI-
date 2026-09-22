@@ -44,6 +44,7 @@ const SCHEMA_PATH = path.join(__dirname, '..', '..', 'schema-pg.sql');
 const TABLES_TO_TRUNCATE = [
   'password_reset_tokens',
   'lead_notifications',
+  'crm_notes',
   'funnel_events',
   'payment_intents',
   'bookings',

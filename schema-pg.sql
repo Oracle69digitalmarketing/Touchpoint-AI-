@@ -159,6 +159,12 @@ CREATE TABLE IF NOT EXISTS leads (
   qualification_status TEXT NOT NULL DEFAULT 'pending',
   source               TEXT NOT NULL DEFAULT 'auto',
   notified             BOOLEAN NOT NULL DEFAULT FALSE,
+  crm_status           TEXT NOT NULL DEFAULT 'new'
+    CHECK (crm_status IN (
+      'new', 'contacted', 'qualified', 'opportunity',
+      'customer', 'unqualified', 'lost', 'do_not_contact'
+    )),
+  assigned_user_id     TEXT REFERENCES users(id) ON DELETE SET NULL,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -169,6 +175,21 @@ CREATE TABLE IF NOT EXISTS lead_notifications (
   lead_id     TEXT NOT NULL UNIQUE REFERENCES leads(id) ON DELETE CASCADE,
   read_at     TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Phase 13F CRM note stream (append-only per-lead notes; human/ai source).
+-- author_user_id is nullable: human notes carry the authenticated author when
+-- applicable, and server/origin notes may have no user author. Nothing
+-- generates AI notes in this phase.
+CREATE TABLE IF NOT EXISTS crm_notes (
+  id             TEXT PRIMARY KEY,
+  business_id    TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  lead_id        TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  author_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  body           TEXT NOT NULL,
+  source         TEXT NOT NULL CHECK (source IN ('human', 'ai')),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Commercial transaction foundation (Phase 13A): deterministic orders, order
@@ -397,6 +418,7 @@ CREATE TABLE IF NOT EXISTS funnel_events (
   business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
   conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
   order_id        TEXT REFERENCES orders(id) ON DELETE SET NULL,
+  lead_id         TEXT REFERENCES leads(id) ON DELETE SET NULL,
   event_type      TEXT NOT NULL,
   meta            JSONB NOT NULL DEFAULT '{}',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -404,6 +426,7 @@ CREATE TABLE IF NOT EXISTS funnel_events (
 
 CREATE INDEX IF NOT EXISTS idx_funnel_events_business ON funnel_events(business_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_funnel_events_type ON funnel_events(business_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_funnel_events_lead ON funnel_events(lead_id);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   business_id                 TEXT PRIMARY KEY REFERENCES businesses(id) ON DELETE CASCADE,
@@ -475,6 +498,9 @@ CREATE INDEX IF NOT EXISTS idx_conversations_touchpoint ON conversations(touchpo
 CREATE INDEX IF NOT EXISTS idx_conversations_stage ON conversations(business_id, stage);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON conversation_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_leads_business ON leads(business_id);
+CREATE INDEX IF NOT EXISTS idx_leads_business_status ON leads(business_id, crm_status);
+CREATE INDEX IF NOT EXISTS idx_leads_assigned ON leads(assigned_user_id) WHERE assigned_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_crm_notes_lead ON crm_notes(lead_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_products_business ON products(business_id);
 CREATE INDEX IF NOT EXISTS idx_products_business_status ON products(business_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_conversation ON leads(conversation_id) WHERE conversation_id IS NOT NULL;

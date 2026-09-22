@@ -104,6 +104,15 @@ import {
   createFunnelEvent,
   countFunnelEventsByType,
   hasFunnelEvent,
+  listCrmLeads,
+  countCrmLeads,
+  getCrmLead,
+  listLeadActivity,
+  setLeadCrmStatus,
+  assignLeadUser,
+  createCrmNote,
+  listCrmNotes,
+  CRM_STATUSES,
   getSubscription,
   resolveSubscription,
   upsertSubscription,
@@ -2007,10 +2016,10 @@ const FUNNEL_EVENT_TYPES = new Set([
   'booking_expired',
 ]);
 
-async function recordFunnelEvent({ businessId, conversationId = null, eventType, meta = null }) {
+async function recordFunnelEvent({ businessId, conversationId = null, leadId = null, eventType, meta = null }) {
   if (!businessId || !FUNNEL_EVENT_TYPES.has(eventType)) return null;
   try {
-    return await createFunnelEvent({ businessId, conversationId, eventType, meta });
+    return await createFunnelEvent({ businessId, conversationId, leadId, eventType, meta });
   } catch (error) {
     console.error('[Funnel Event] Record failed:', error.message);
     return null;
@@ -2024,7 +2033,7 @@ async function recordFunnelEvent({ businessId, conversationId = null, eventType,
  * a different set of channels uses a different key and is still recorded. The
  * `key` is persisted inside meta so the probe can find it again.
  */
-async function recordFunnelEventOnce({ businessId, conversationId, eventType, key = null, meta = null }) {
+async function recordFunnelEventOnce({ businessId, conversationId, eventType, key = null, meta = null, leadId = null }) {
   if (!businessId || !FUNNEL_EVENT_TYPES.has(eventType)) return null;
   try {
     const exists = await hasFunnelEvent({ businessId, conversationId, eventType, metaKey: key });
@@ -2037,6 +2046,7 @@ async function recordFunnelEventOnce({ businessId, conversationId, eventType, ke
     businessId,
     conversationId,
     eventType,
+    leadId,
     meta: key ? { ...(meta || {}), key } : meta,
   });
 }
@@ -2250,12 +2260,16 @@ async function captureLeadFromConversation({ conversation, touchpoint = null, bu
   }
 
   // Lead-intelligence funnel events, only for transitions actually observed.
+  // The lead id is attached whenever a lead exists for this conversation, so
+  // the CRM activity timeline sees these events; deduplication semantics are
+  // unchanged (the events were already deduped by the caller/flow).
   if (existing) {
     for (const key of ['name', 'phone', 'email']) {
       if (!existing[key] && lead[key]) {
         await recordFunnelEvent({
           businessId: bizId,
           conversationId: conversation.id,
+          leadId: lead.id,
           eventType: 'lead_field_captured',
           meta: { field: key },
         });
@@ -2270,6 +2284,7 @@ async function captureLeadFromConversation({ conversation, touchpoint = null, bu
       await recordFunnelEvent({
         businessId: bizId,
         conversationId: conversation.id,
+        leadId: lead.id,
         eventType: 'qualification_updated',
         meta: { from: existing.qualification_status, to: lead.qualification_status },
       });
@@ -2280,6 +2295,7 @@ async function captureLeadFromConversation({ conversation, touchpoint = null, bu
         await recordFunnelEvent({
           businessId: bizId,
           conversationId: conversation.id,
+          leadId: lead.id,
           eventType: 'lead_field_captured',
           meta: { field: key },
         });
@@ -3129,9 +3145,14 @@ async function runConversationEngine({ touchpoint = null, business = null, agent
   // Phase 5: extract and persist a lead from the exchange. Failures here are
   // logged and swallowed so a transient AI hiccup never breaks the chat. The
   // freshly derived state is passed in so deterministic captures made by THIS
-  // message are authoritative immediately, never lagging by a message.
+  // message are authoritative immediately, never lagging by a message. The
+  // returned lead becomes the CRM attribution anchor for this turn's funnel
+  // events: on a first qualifying message the lead is created HERE, after the
+  // earlier `findLeadByConversation` probe above, so we prefer the freshly
+  // captured lead instead of the stale null from the pre-capture probe.
+  let eventLead = null;
   try {
-    await captureLeadFromConversation({
+    eventLead = await captureLeadFromConversation({
       conversation,
       touchpoint,
       businessId,
@@ -3142,6 +3163,7 @@ async function runConversationEngine({ touchpoint = null, business = null, agent
   } catch (error) {
     console.error('[Lead Capture] Extraction error:', error);
   }
+  const eventLeadId = eventLead && eventLead.id ? eventLead.id : (lead && lead.id ? lead.id : null);
 
   // Batch 3 funnel events: each records a transition the application actually
   // observed between the persisted state before this message and the new state.
@@ -3151,31 +3173,31 @@ async function runConversationEngine({ touchpoint = null, business = null, agent
   const prevState = (conversation && conversation.salesState) || {};
   try {
     if (!prevState.recommendedProductId && finalState.recommendedProductId) {
-      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'recommendation_made', meta: { productId: finalState.recommendedProductId } });
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'recommendation_made', meta: { productId: finalState.recommendedProductId } });
     }
     if (!prevState.buyingSignal && finalState.buyingSignal) {
-      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'buying_signal_detected' });
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'buying_signal_detected' });
     }
     if (!prevState.objection && finalState.objection) {
-      await recordFunnelEvent({ businessId, conversationId: conversation.id, eventType: 'objection_detected', meta: { type: finalState.objection } });
+      await recordFunnelEvent({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'objection_detected', meta: { type: finalState.objection } });
     }
     if (finalState.nextBestAction === 'offer_booking') {
-      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'booking_started', key: finalState.nextBestAction });
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'booking_started', key: finalState.nextBestAction });
     }
     if (finalState.nextBestAction === 'offer_quote') {
-      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'quote_requested', key: finalState.nextBestAction });
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'quote_requested', key: finalState.nextBestAction });
     }
     if (finalState.nextBestAction === 'offer_demo') {
-      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'demo_requested', key: finalState.nextBestAction });
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'demo_requested', key: finalState.nextBestAction });
     }
     if (finalState.nextBestAction === 'close' && detectConversionAction(message) === 'purchase') {
-      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'purchase_started', key: finalState.nextBestAction });
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'purchase_started', key: finalState.nextBestAction });
     }
     const configuredChannels = buildHandoffChannels(owner || {});
     const offeredTypes = channelsOfferedInReply(replyText, configuredChannels);
     if (offeredTypes.length > 0) {
       const offeredKey = `${finalState.nextBestAction || 'handoff'}:${offeredTypes.join('+')}`;
-      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, eventType: 'handoff_offered', key: offeredKey, meta: { action: finalState.nextBestAction || null, channels: offeredTypes } });
+      await recordFunnelEventOnce({ businessId, conversationId: conversation.id, leadId: eventLeadId, eventType: 'handoff_offered', key: offeredKey, meta: { action: finalState.nextBestAction || null, channels: offeredTypes } });
     }
   } catch (error) {
     console.error('[Funnel Events] Recording failed:', error);
@@ -3377,9 +3399,60 @@ const publicLeadNotification = (n) => ({
   createdAt: n.created_at,
 });
 
-// List the authenticated business's leads, newest activity first.
+// List the authenticated business's leads, newest activity first. Enriched
+// with CRM + conversation intelligence and optional server-side filters.
+// Every filter is validated against a fixed enum (or a bounded string), and
+// page bounds are capped — a client can never inject SQL or unbounded scans.
 app.get('/v1/leads', asyncHandler(async (req, res) => {
-  res.status(200).json({ leads: (await listLeads(req.business.id)).map(publicLead) });
+  const q = req.query || {};
+  const filters = {};
+
+  if (q.crmStatus !== undefined && q.crmStatus !== '') {
+    if (!CRM_STATUSES.includes(q.crmStatus)) {
+      return res.status(400).json({ error: `crmStatus must be one of: ${CRM_STATUSES.join(', ')}` });
+    }
+    filters.crmStatus = q.crmStatus;
+  }
+  if (q.assignedUserId !== undefined && q.assignedUserId !== '') {
+    if (typeof q.assignedUserId !== 'string' || q.assignedUserId.length > 200) {
+      return res.status(400).json({ error: 'assignedUserId must be a valid user id' });
+    }
+    filters.assignedUserId = q.assignedUserId;
+  }
+  if (q.qualificationStatus !== undefined && q.qualificationStatus !== '') {
+    if (!LEAD_STATUSES.includes(q.qualificationStatus)) {
+      return res.status(400).json({ error: `qualificationStatus must be one of: ${LEAD_STATUSES.join(', ')}` });
+    }
+    filters.qualificationStatus = q.qualificationStatus;
+  }
+  if (q.source !== undefined && q.source !== '') {
+    if (!LEAD_SOURCES.includes(q.source)) {
+      return res.status(400).json({ error: `source must be one of: ${LEAD_SOURCES.join(', ')}` });
+    }
+    filters.source = q.source;
+  }
+  if (q.search !== undefined && q.search !== '') {
+    const search = cleanString(q.search, 200);
+    if (!search) {
+      return res.status(400).json({ error: 'search must be a non-empty string of 200 characters or fewer' });
+    }
+    filters.search = search;
+  }
+
+  const limit = parseIntParam(q.limit, { fallback: CRM_LEAD_PAGE_DEFAULT, min: 1, max: CRM_LEAD_PAGE_MAX });
+  if (limit === null) {
+    return res.status(400).json({ error: `limit must be an integer between 1 and ${CRM_LEAD_PAGE_MAX}` });
+  }
+  const offset = parseIntParam(q.offset, { fallback: 0, min: 0, max: CRM_LEAD_PAGE_MAX_OFFSET });
+  if (offset === null) {
+    return res.status(400).json({ error: `offset must be an integer between 0 and ${CRM_LEAD_PAGE_MAX_OFFSET}` });
+  }
+
+  const [leads, total] = await Promise.all([
+    listCrmLeads(req.business.id, { ...filters, limit, offset }),
+    countCrmLeads(req.business.id, filters),
+  ]);
+  res.status(200).json({ leads: leads.map(publicCrmLead), total, limit, offset });
 }));
 
 // In-app notifications for newly qualified leads (unread first).
@@ -3524,9 +3597,9 @@ app.post('/v1/leads', asyncHandler(async (req, res) => {
 
 // Get a single lead (scoped to the authenticated business)
 app.get('/v1/leads/:id', asyncHandler(async (req, res) => {
-  const lead = await getLeadById(req.business.id, req.params.id);
+  const lead = await getCrmLead(req.business.id, req.params.id);
   if (!lead) return res.status(404).json({ error: 'Lead not found' });
-  res.status(200).json({ lead: publicLead(lead) });
+  res.status(200).json({ lead: publicCrmLead(lead) });
 }));
 
 // Update a lead's contact/qualification fields (scoped to the authenticated
@@ -3589,6 +3662,185 @@ app.put('/v1/leads/:id', asyncHandler(async (req, res) => {
   }
 
   res.status(200).json({ lead: publicLead(updated) });
+}));
+
+/**
+ * PHASE 13F CRM OPERATIONS
+ *
+ * Operational CRM surface over the existing lead/conversation model — no second
+ * lead system. Every route is tenant-scoped by req.business.id, which comes
+ * from the authenticated session (a client-supplied business id is never
+ * trusted). CRM status, assignment and notes are server-authoritative
+ * operator state: the AI conversation engine never calls these endpoints, and
+ * conversation stage / qualification / payment / order / booking / WhatsApp
+ * semantics are untouched.
+ */
+
+const LEAD_SOURCES = ['auto', 'manual'];
+const CRM_LEAD_PAGE_DEFAULT = 50;
+const CRM_LEAD_PAGE_MAX = 100;
+const CRM_LEAD_PAGE_MAX_OFFSET = 100000;
+const CRM_NOTE_BODY_MAX = 5000;
+
+function parseIntParam(value, { fallback, min, max }) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n)) return null;
+  if (n < min || n > max) return null;
+  return n;
+}
+
+// Enriched CRM lead response: publicLead fields preserved (backward
+// compatible) plus CRM state and conversation intelligence derived on read.
+const publicCrmLead = (row) => ({
+  id: row.id,
+  name: row.name,
+  phone: row.phone,
+  email: row.email,
+  intent: row.intent,
+  qualificationScore: row.qualification_score,
+  qualificationStatus: row.qualification_status,
+  source: row.source,
+  notified: row.notified,
+  touchpointId: row.touchpoint_id,
+  touchpointName: row.touchpoint_name,
+  agentId: row.agent_id,
+  agentName: row.agent_name,
+  conversationId: row.conversation_id,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  crmStatus: row.crm_status,
+  assignedUser: row.assigned_user_id ? { id: row.assigned_user_id, name: row.assigned_user_name } : null,
+  conversationCount: row.conversation_count,
+  firstInteraction: row.created_at,
+  lastInteraction: row.last_interaction,
+  salesStage: row.sales_stage,
+  conversationIntent: row.conversation_intent,
+  customerNeed: row.customer_need,
+  recommendedProduct: row.recommended_product_id ? { id: row.recommended_product_id, name: row.recommended_product_name } : null,
+  buyingSignal: row.buying_signal,
+  objection: row.objection,
+  nextBestAction: row.next_best_action,
+  channel: row.channel,
+  customerName: row.customer_name,
+});
+
+const publicCrmNote = (note) => ({
+  id: note.id,
+  leadId: note.lead_id,
+  authorUserId: note.author_user_id,
+  body: note.body,
+  source: note.source,
+  createdAt: note.created_at,
+  updatedAt: note.updated_at,
+});
+
+const publicCrmActivity = (event) => ({
+  id: event.id,
+  eventType: event.event_type,
+  conversationId: event.conversation_id,
+  orderId: event.order_id,
+  leadId: event.lead_id,
+  meta: event.meta,
+  createdAt: event.created_at,
+});
+
+// Update a lead's operator-controlled CRM status. Only crm_status changes;
+// conversation stage, qualification state and sales intelligence are separate
+// systems and are never touched here.
+app.put('/v1/leads/:id/crm-status', asyncHandler(async (req, res) => {
+  const lead = await getCrmLead(req.business.id, req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+  const body = req.body || {};
+  if (body.crmStatus === undefined || body.crmStatus === null) {
+    return res.status(400).json({ error: 'crmStatus is required' });
+  }
+  if (!CRM_STATUSES.includes(body.crmStatus)) {
+    return res.status(400).json({ error: `crmStatus must be one of: ${CRM_STATUSES.join(', ')}` });
+  }
+
+  await setLeadCrmStatus(req.business.id, lead.id, body.crmStatus);
+  res.status(200).json({ lead: publicCrmLead(await getCrmLead(req.business.id, lead.id)) });
+}));
+
+// Assign (or, with a null/absent id, unassign) a workspace user to a lead.
+// assignLeadUser() enforces that the user belongs to the authenticated
+// business; a user from any other business is rejected.
+app.put('/v1/leads/:id/assignment', asyncHandler(async (req, res) => {
+  const lead = await getCrmLead(req.business.id, req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+  const body = req.body || {};
+  let assignedUserId = null;
+  if (body.assignedUserId !== undefined && body.assignedUserId !== null && body.assignedUserId !== '') {
+    if (typeof body.assignedUserId !== 'string' || body.assignedUserId.length > 200) {
+      return res.status(400).json({ error: 'assignedUserId must be a valid user id' });
+    }
+    assignedUserId = body.assignedUserId;
+  }
+
+  let assigned;
+  try {
+    assigned = await assignLeadUser(req.business.id, lead.id, assignedUserId);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!assigned) return res.status(404).json({ error: 'Lead not found' });
+
+  res.status(200).json({ lead: publicCrmLead(await getCrmLead(req.business.id, assigned.id)) });
+}));
+
+// Create a CRM note on a lead. The author is ALWAYS the authenticated user; a
+// client-supplied author id (authorUserId) is ignored so no client can
+// impersonate another user, and no AI note is generated. source 'ai' is
+// reserved for trusted internal/server writers and is rejected from the API.
+app.post('/v1/leads/:id/notes', asyncHandler(async (req, res) => {
+  const lead = await getCrmLead(req.business.id, req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+  const body = req.body || {};
+  const noteBody = typeof body.body === 'string' ? body.body.trim() : '';
+  if (!noteBody) {
+    return res.status(400).json({ error: 'body must be a non-empty string' });
+  }
+  if (noteBody.length > CRM_NOTE_BODY_MAX) {
+    return res.status(400).json({ error: `body must be ${CRM_NOTE_BODY_MAX} characters or fewer` });
+  }
+  if (body.source === 'ai') {
+    return res.status(400).json({ error: 'source "ai" is reserved for trusted internal writes; clients may only create human notes' });
+  }
+  if (body.source !== undefined && body.source !== 'human') {
+    return res.status(400).json({ error: `source must be "human"` });
+  }
+
+  const note = await createCrmNote({
+    businessId: req.business.id,
+    leadId: lead.id,
+    authorUserId: req.user.id,
+    body: noteBody,
+    source: 'human',
+  });
+  res.status(201).json({ note: publicCrmNote(note) });
+}));
+
+// List a lead's CRM notes (newest first), tenant-scoped.
+app.get('/v1/leads/:id/notes', asyncHandler(async (req, res) => {
+  const lead = await getCrmLead(req.business.id, req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  const notes = await listCrmNotes(req.business.id, lead.id);
+  res.status(200).json({ notes: notes.map(publicCrmNote) });
+}));
+
+// CRM activity timeline: funnel events anchored directly by lead_id plus events
+// attached through the lead's 1:1 conversation. The set union means an event
+// carrying both anchors appears exactly once. Read-only; a lead from another
+// tenant behaves as not found.
+app.get('/v1/leads/:id/activity', asyncHandler(async (req, res) => {
+  const lead = await getCrmLead(req.business.id, req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  const events = await listLeadActivity(req.business.id, lead.id, lead.conversation_id);
+  res.status(200).json({ activity: events.map(publicCrmActivity) });
 }));
 
 /**
@@ -4227,6 +4479,7 @@ app.post('/v1/orders', requireAuth, asyncHandler(async (req, res) => {
   await recordFunnelEventOnce({
     businessId: req.business.id,
     conversationId,
+    leadId,
     eventType: 'order_created',
     key: `order:${created.orderId}`,
     meta: { orderId: created.orderId, items: resolved.length, total: created.total, currency },
@@ -4302,6 +4555,7 @@ async function paymentInitHandler(req, res) {
   await recordFunnelEventOnce({
     businessId: req.business.id,
     conversationId: result.order.conversation_id,
+    leadId: (result.order && result.order.lead_id) || null,
     eventType: 'payment_started',
     key: `order:${result.order.id}:payment`,
     meta: { orderId: result.order.id, intentId: result.intent.id, provider },
@@ -4346,6 +4600,7 @@ async function emitPaymentOutcomeEvents(outcome) {
       await recordFunnelEventOnce({
         businessId,
         conversationId: order.conversation_id,
+        leadId: order.lead_id || null,
         eventType: 'payment_verified',
         key: `intent:${intentId}`,
         meta: { orderId, intentId, provider: outcome.provider },
@@ -4354,6 +4609,7 @@ async function emitPaymentOutcomeEvents(outcome) {
       await recordFunnelEventOnce({
         businessId,
         conversationId: order.conversation_id,
+        leadId: order.lead_id || null,
         eventType: 'payment_failed',
         key: `intent:${intentId}`,
         meta: { orderId, intentId, reason: outcome.reason || outcome.failureReason || null },
@@ -4417,6 +4673,7 @@ app.post('/v1/orders/:id/cancel', requireAuth, asyncHandler(async (req, res) => 
   await recordFunnelEventOnce({
     businessId: req.business.id,
     conversationId: order.conversation_id,
+    leadId: order.lead_id || null,
     eventType: 'order_cancelled',
     key: `order:${order.id}:cancelled`,
     meta: { orderId: order.id, wasPendingPayment: order.status === 'pending_payment' },
@@ -4448,6 +4705,7 @@ app.post('/v1/orders/:id/items', requireAuth, asyncHandler(async (req, res) => {
   await recordFunnelEventOnce({
     businessId: req.business.id,
     conversationId: order.conversation_id,
+    leadId: order.lead_id || null,
     eventType: 'order_item_added',
     key: `order:${order.id}:item:${resolved[0].productId}`,
     meta: { orderId: order.id, productId: resolved[0].productId },
@@ -4590,6 +4848,7 @@ app.post('/v1/commercial/actions/:id/execute', requireAuth, asyncHandler(async (
     await recordFunnelEventOnce({
       businessId: req.business.id,
       conversationId: action.conversation_id,
+      leadId: (initResult.order && initResult.order.lead_id) || action.lead_id || null,
       eventType: 'payment_started',
       key: `order:${action.order_id}:payment`,
       meta: { orderId: action.order_id, intentId: initResult.intent.id, provider: initResult.intent.provider },
@@ -4724,6 +4983,7 @@ async function recordBookingFunnelEvent(businessId, conversationId, eventType, b
   await recordFunnelEventOnce({
     businessId,
     conversationId: conversationId || (booking && booking.conversation_id) || null,
+    leadId: (booking && booking.lead_id) || null,
     eventType,
     key: booking ? `booking:${booking.id}` : null,
     meta: booking
@@ -4756,11 +5016,20 @@ async function performBookingReservation(businessId, { productId, token, custome
   if (!bookingIsExactSlot({ config, start: parsed.start, end: parsed.end, nowUtc: new Date() })) {
     return { error: 'This slot is no longer on the schedule.', code: 'INVALID_SLOT', status: 409 };
   }
+  // CRM attribution: resolve the conversation's lead ONCE and store it on the
+  // booking row, so every later lifecycle event (confirm/cancel/complete/...)
+  // reads the authoritative lead from the booking itself — no repeated lookups.
+  let leadId = null;
+  if (conversationId) {
+    const convoLead = await findLeadByConversation(businessId, conversationId);
+    leadId = convoLead ? convoLead.id : null;
+  }
   try {
     return await reserveBooking({
       businessId,
       productId,
       conversationId,
+      leadId,
       slot: {
         start: parsed.start,
         end: parsed.end,
