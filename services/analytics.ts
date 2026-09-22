@@ -1,5 +1,5 @@
 
-import { AnalyticsRange, AnalyticsOverview, TouchpointPerformance, AgentPerformance } from '../types';
+import { AnalyticsRange, AnalyticsOverview, FunnelAnalytics, TouchpointPerformance, AgentPerformance } from '../types';
 import { getAuthHeaders } from './auth';
 
 /**
@@ -33,5 +33,14 @@ export const analyticsService = {
   async agents(range: AnalyticsRange = '30d'): Promise<{ range: AnalyticsRange; agents: AgentPerformance[] }> {
     const res = await fetch(`${API_BASE}/analytics/agents?range=${range}`, { headers: getAuthHeaders() });
     return handleResponse<{ range: AnalyticsRange; agents: AgentPerformance[] }>(res);
+  },
+
+  // Phase 13G: per-event funnel counts for the workspace. The server returns
+  // honest counts for every funnel event type it ever records; a quiet tenant
+  // gets zeroes rather than invented activity. The UI renders these as an event
+  // landscape, never as a strict cohort conversion funnel.
+  async funnel(range: AnalyticsRange = '7d'): Promise<FunnelAnalytics> {
+    const res = await fetch(`${API_BASE}/analytics/funnel?range=${range}`, { headers: getAuthHeaders() });
+    return handleResponse<FunnelAnalytics>(res);
   },
 };

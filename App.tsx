@@ -7,6 +7,9 @@ import TouchpointMatrix from './components/TouchpointMatrix';
 import SurfaceGenerator from './components/SurfaceGenerator';
 import AgentTrainingWizard from './components/AgentTrainingWizard';
 import ConversationHub from './components/ConversationHub';
+import LeadPipeline from './components/LeadPipeline';
+import LeadDetail from './components/LeadDetail';
+import FunnelView from './components/FunnelView';
 import Settings from './components/Settings';
 import OnboardingGuide from './components/OnboardingGuide';
 import { Agent, Touchpoint, Conversation, CRMConnection, SubscriptionPlan, PLAN_LIMITS, AgentStatus, Lead, LeadNotification } from './types';
@@ -48,6 +51,20 @@ const Workspace: React.FC = () => {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [notifications, setNotifications] = useState<LeadNotification[]>([]);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
+
+  // Phase 13F-F: the CRM detail overlays the active workspace surface so the
+  // operator keeps their current context (e.g. the conversation sandbox) while
+  // working the lead; `leadRefresh` tells the pipeline to refetch after a
+  // server-confirmed mutation in the detail view.
+  const [selectedLeadId, setSelectedLeadId] = useState<string | null>(null);
+  const [leadRefresh, setLeadRefresh] = useState(0);
+
+  const openLead = (id: string) => setSelectedLeadId(id);
+
+  const handleLeadUpdated = (updated: Lead) => {
+    setLeads(prev => prev.map(l => l.id === updated.id ? updated : l));
+    setLeadRefresh(k => k + 1);
+  };
 
   // Load the authenticated business's persisted data.
   useEffect(() => {
@@ -262,7 +279,11 @@ const Workspace: React.FC = () => {
           </div>
         );
       case 'conversations':
-        return <div className={contentClass}><ConversationHub conversations={conversations} leads={leads} agents={agents} currentLanguage={language} currentCurrency={currency} /></div>;
+        return <div className={contentClass}><ConversationHub conversations={conversations} leads={leads} agents={agents} currentLanguage={language} currentCurrency={currency} onOpenLead={openLead} /></div>;
+      case 'leads':
+        return <div className={contentClass}><LeadPipeline onOpenLead={openLead} refreshKey={leadRefresh} /></div>;
+      case 'funnel':
+        return <div className={contentClass}><FunnelView onOpenLead={openLead} /></div>;
       case 'settings':
         return <div className={contentClass}><Settings 
           currentLanguage={language} onLanguageChange={setLanguage} currentCurrency={currency} onCurrencyChange={setCurrency}
@@ -289,7 +310,16 @@ const Workspace: React.FC = () => {
       businessName={business.name}
       onLogout={logout}
     >
-      <div className="max-w-7xl mx-auto">{renderContent()}</div>
+      <div className="max-w-7xl mx-auto relative">
+        {renderContent()}
+        {selectedLeadId && (
+          <LeadDetail
+            leadId={selectedLeadId}
+            onClose={() => setSelectedLeadId(null)}
+            onLeadUpdated={handleLeadUpdated}
+          />
+        )}
+      </div>
     </Layout>
   );
 };

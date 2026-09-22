@@ -92,6 +92,43 @@ export interface Conversation {
 
 export type LeadQualificationStatus = 'qualified' | 'unqualified' | 'pending';
 
+/**
+ * Operator-controlled CRM status. These exact persisted backend values are
+ * fixed by the Phase 13F server contract; display labels may differ, the
+ * stored values must not be renamed.
+ */
+export type CRMStatus =
+  | 'new'
+  | 'contacted'
+  | 'qualified'
+  | 'opportunity'
+  | 'customer'
+  | 'unqualified'
+  | 'lost'
+  | 'do_not_contact';
+
+export const CRM_STATUSES: CRMStatus[] = [
+  'new',
+  'contacted',
+  'qualified',
+  'opportunity',
+  'customer',
+  'unqualified',
+  'lost',
+  'do_not_contact',
+];
+
+export const CRM_STATUS_LABELS: Record<CRMStatus, string> = {
+  new: 'New',
+  contacted: 'Contacted',
+  qualified: 'Qualified',
+  opportunity: 'Opportunity',
+  customer: 'Customer',
+  unqualified: 'Unqualified',
+  lost: 'Lost',
+  do_not_contact: 'Do Not Contact',
+};
+
 export interface Lead {
   id: string;
   name: string | null;
@@ -109,6 +146,64 @@ export interface Lead {
   conversationId: string | null;
   createdAt: string;
   updatedAt: string;
+  // Phase 13F CRM surface. Every field here mirrors what the backend returns
+  // from publicCrmLead (GET /v1/leads, GET /v1/leads/:id and the mutation
+  // responses). Nothing is invented client-side.
+  crmStatus: CRMStatus;
+  assignedUser: { id: string; name: string } | null;
+  conversationCount: number;
+  firstInteraction: string;
+  lastInteraction: string | null;
+  salesStage: string | null;
+  conversationIntent: string | null;
+  customerNeed: string | null;
+  recommendedProduct: { id: string; name: string } | null;
+  buyingSignal: boolean | null;
+  objection: string | null;
+  nextBestAction: string | null;
+  channel: string | null;
+  customerName: string | null;
+}
+
+/**
+ * A CRM note on a lead. `authorUserId` is always server-assigned (the
+ * authenticated user); `source` distinguishes an operator note ('human') from
+ * a trusted internal/AI write ('ai') that the API never permits clients to
+ * create.
+ */
+export interface LeadNote {
+  id: string;
+  leadId: string;
+  authorUserId: string | null;
+  body: string;
+  source: 'human' | 'ai';
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A single funnel activity event in a lead's CRM timeline. Fields mirror
+ * publicCrmActivity; the frontend renders exactly what the backend returns and
+ * never fabricates events.
+ */
+export interface LeadActivityEvent {
+  id: string;
+  eventType: string;
+  conversationId: string | null;
+  orderId: string | null;
+  leadId: string | null;
+  meta: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+/**
+ * Bounded, filtered lead listing page as returned by GET /v1/leads.
+ */
+export interface LeadPage {
+  leads: Lead[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface LeadNotification {
@@ -269,4 +364,85 @@ export interface AgentPerformance {
   leads: number;
   qualifiedLeads: number;
   qualificationRate: number;
+}
+
+// Phase 13G: Conversion Pulse — exact server-returned shapes for the tenant's
+// commercial pipeline. These mirror the backend's public serializers
+// (publicOrder / publicBooking / publicIntent / /v1/analytics/funnel) so the
+// operator UI never computes or assumes financial figures.
+
+export interface FunnelEvents {
+  [eventType: string]: number;
+}
+
+export interface FunnelAnalytics {
+  range: AnalyticsRange;
+  events: FunnelEvents;
+}
+
+export interface OrderItem {
+  id: string;
+  productId: string;
+  productName: string;
+  quantity: number;
+  unitPrice: number;
+  total: number;
+}
+
+export interface Order {
+  id: string;
+  businessId: string;
+  conversationId: string | null;
+  leadId: string | null;
+  channel: string;
+  customerName: string | null;
+  status: string;
+  currency: string;
+  subtotal: number;
+  total: number;
+  paymentStatus: string;
+  fulfillmentStatus: string | null;
+  metadata: Record<string, unknown>;
+  items?: OrderItem[];
+  itemCount?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PaymentIntent {
+  id: string;
+  orderId: string;
+  provider: string;
+  status: string;
+  providerReference: string | null;
+  amountMinor: number;
+  currency: string;
+  checkout: Record<string, unknown>;
+  failureReason: string | null;
+  paidAmountMinor: number | null;
+  verifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Booking {
+  id: string;
+  productId: string;
+  productName: string | null;
+  conversationId: string | null;
+  leadId: string | null;
+  customer: { name: string | null; phone: string | null; email: string | null };
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  timezone: string | null;
+  durationMinutes: number | null;
+  requestedStartAt: string;
+  endAt: string;
+  status: string;
+  holdUntil: string | null;
+  configVersion: number | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
 }

@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { LayoutDashboard, Bot, QrCode, MessageSquare, Settings as SettingsIcon, Bell, ChevronDown, Coins, HelpCircle, LogOut, CheckCheck, User } from 'lucide-react';
+import { LayoutDashboard, Bot, QrCode, MessageSquare, Settings as SettingsIcon, Bell, ChevronDown, Coins, HelpCircle, LogOut, CheckCheck, User, Users, TrendingUp } from 'lucide-react';
 import { SUPPORTED_LANGUAGES, SUPPORTED_CURRENCIES, SubscriptionPlan, PLAN_LIMITS, LeadNotification } from '../types';
 
 interface LayoutProps {
@@ -45,6 +45,8 @@ const Layout: React.FC<LayoutProps> = ({
     { id: 'agents', label: 'Agents', icon: Bot },
     { id: 'touchpoints', label: 'Matrix', icon: QrCode },
     { id: 'conversations', label: 'Sales', icon: MessageSquare },
+    { id: 'leads', label: 'Leads', icon: Users },
+    { id: 'funnel', label: 'Funnel', icon: TrendingUp },
     { id: 'onboarding', label: 'Guide', icon: HelpCircle },
     { id: 'settings', label: 'Config', icon: SettingsIcon },
   ];
