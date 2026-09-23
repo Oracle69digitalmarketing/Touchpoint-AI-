@@ -1,9 +1,11 @@
 
 import React, { useState, useEffect } from 'react';
-import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink, ShieldCheck, RefreshCw } from 'lucide-react';
+import { Globe, Shield, CreditCard, Trash2, Check, Loader2, X, AlertTriangle, ExternalLink, ShieldCheck, RefreshCw, Package, MessageSquare } from 'lucide-react';
 import { SUPPORTED_LANGUAGES, CRMConnection, SubscriptionPlan, Subscription, PLAN_LIMITS } from '../types';
 import { getAuthHeaders } from '../services/auth';
 import { billingService } from '../services/billing';
+import ProductCatalog from './ProductCatalog';
+import HandoffSettingsSection from './HandoffSettings';
 
 interface Props {
   currentLanguage: string;
@@ -34,6 +36,10 @@ const Settings: React.FC<Props> = ({
   const [processingPlan, setProcessingPlan] = useState<SubscriptionPlan | null>(null);
   const [subError, setSubError] = useState('');
   const [subscriptionDetail, setSubscriptionDetail] = useState<Subscription | null>(null);
+
+  // Phase 13H-2: internal Config workspace sections. Top-level navigation is
+  // unchanged; these switch which workspace renders inside the Config tab.
+  const [configSection, setConfigSection] = useState<'overview' | 'catalog' | 'handoff'>('overview');
 
   // Identity Verification State
   const [banks, setBanks] = useState<{name: string, code: string}[]>([]);
@@ -181,6 +187,33 @@ const Settings: React.FC<Props> = ({
         <p className="text-slate-500 font-medium">Provision nodes and manage global representation logic.</p>
       </div>
 
+      <div className="flex flex-wrap gap-2">
+        {([
+          { key: 'overview', label: 'Overview', icon: <Shield size={15} /> },
+          { key: 'catalog', label: 'Product Catalog', icon: <Package size={15} /> },
+          { key: 'handoff', label: 'Business & Handoff', icon: <MessageSquare size={15} /> },
+        ] as const).map((section) => (
+          <button
+            key={section.key}
+            onClick={() => setConfigSection(section.key)}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+              configSection === section.key
+                ? 'bg-slate-900 text-white shadow-lg'
+                : 'bg-white text-slate-600 border border-slate-100 hover:bg-slate-50'
+            }`}
+          >
+            {section.icon}
+            {section.label}
+          </button>
+        ))}
+      </div>
+
+      {configSection === 'catalog' ? (
+        <ProductCatalog />
+      ) : configSection === 'handoff' ? (
+        <HandoffSettingsSection />
+      ) : (
+      <>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
         <div className="lg:col-span-2 space-y-8">
           {/* CRM Section */}
@@ -509,6 +542,8 @@ const Settings: React.FC<Props> = ({
           </div>
         </div>
       )}
+    </>
+    )}
     </div>
   );
 };

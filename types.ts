@@ -446,3 +446,126 @@ export interface Booking {
   createdAt: string;
   updatedAt: string;
 }
+
+// Phase 13H-2: Operator Configuration UI — Product Catalog / Business & Handoff
+// / Booking Configuration. Node shapes below mirror the exact public
+// serializers already served by the backend (publicProduct, publicHandoff,
+// publicBookingConfig). Nothing is invented client-side.
+
+export const PRODUCT_CURRENCIES = ['NGN', 'USD', 'EUR', 'GBP', 'JPY', 'INR'] as const;
+export type ProductCurrency = (typeof PRODUCT_CURRENCIES)[number];
+
+export const PRODUCT_STATUSES = ['active', 'inactive'] as const;
+export type ProductStatus = (typeof PRODUCT_STATUSES)[number];
+
+/**
+ * A structured catalog item as returned by GET /v1/products. `price` is the
+ * backend's NUMERIC(14,2) value coerced to a JS number by the server — the
+ * frontend never re-calculates money and submits it back verbatim.
+ */
+export interface Product {
+  id: string;
+  name: string;
+  description: string | null;
+  category: string | null;
+  price: number;
+  currency: ProductCurrency;
+  status: ProductStatus;
+  bookable: boolean;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProductInput {
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  price: number;
+  currency?: ProductCurrency;
+  status?: ProductStatus;
+  bookable?: boolean;
+}
+
+/**
+ * Business handoff channels returned by GET /v1/business/handoff. Every field
+ * is nullable: the backend permits each channel to be empty.
+ */
+export interface HandoffSettings {
+  whatsapp: string | null;
+  phone: string | null;
+  email: string | null;
+  bookingUrl: string | null;
+}
+
+export interface HandoffInput {
+  whatsapp?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  bookingUrl?: string | null;
+}
+
+/**
+ * Booking policy as returned by GET /v1/booking/configs (camelCase). The PUT
+ * request body is snake_case; the service adapts between the two.
+ */
+export interface BookingConfig {
+  productId: string;
+  productName: string | null;
+  productBookable: boolean;
+  timezone: string;
+  slotDurationMinutes: number;
+  bufferMinutes: number;
+  capacity: number;
+  operatingHours: Record<string, string>;
+  blackoutDates: string[];
+  minAdvanceHours: number;
+  maxAdvanceDays: number;
+  autoConfirm: boolean;
+  holdMinutes: number;
+  allowReschedule: boolean;
+  requiresPayment: boolean;
+  configVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The operator-editable booking policy fields. The remaining published fields
+ * (operatingHours, blackoutDates, allowReschedule) are preserved unchanged on
+ * a merged full-config save.
+ */
+export interface BookingConfigInput {
+  timezone: string;
+  slotDurationMinutes: number;
+  bufferMinutes: number;
+  capacity: number;
+  minAdvanceHours: number;
+  maxAdvanceDays: number;
+  holdMinutes: number;
+  autoConfirm: boolean;
+  requiresPayment: boolean;
+}
+
+/**
+ * Request-side constraint ranges the backend enforces (booking-time.js /
+ * booking-provider.js). Mirrored for inline form hints only; the server remains
+ * the source of truth.
+ */
+export const BOOKING_CONFIG_CONSTRAINTS = {
+  slotDurationMinutes: { min: 5, max: 480 },
+  bufferMinutes: { min: 0, max: 1440 },
+  capacity: { min: 1, max: 100 },
+  minAdvanceHours: { min: 0, max: 720 },
+  maxAdvanceDays: { min: 1, max: 365 },
+  holdMinutes: { min: 1, max: 1440 },
+} as const;
+
+/**
+ * Booking timezone default: the operator's local zone when it resolves,
+ * otherwise the lock-in fallback. Always left editable in the UI.
+ */
+export const defaultBookingTimezone = (): string => {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz && tz.trim() ? tz : 'Africa/Lagos';
+};
