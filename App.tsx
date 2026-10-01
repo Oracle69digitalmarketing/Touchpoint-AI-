@@ -19,8 +19,25 @@ import { conversationService } from './services/conversations';
 import { leadService } from './services/leads';
 import { billingService } from './services/billing';
 import AuthGate, { useAuth } from './components/AuthGate';
+import ProductPage from './components/ProductPage';
+
+/**
+ * Public-route check for the buyer-facing product page.
+ *
+ * The Express server's SPA catch-all serves dist/index.html for any unknown
+ * non-API GET route, so /product boots this same bundle. Matching the pathname
+ * here (outside <AuthGate>) is what keeps /product public while / stays
+ * behind authentication. No router dependency is introduced on purpose.
+ */
+export const isPublicProductRoute = (pathname: string): boolean => {
+  const normalized = pathname.replace(/\/+$/, '') || '/';
+  return normalized === '/product';
+};
 
 const App: React.FC = () => {
+  if (typeof window !== 'undefined' && isPublicProductRoute(window.location.pathname)) {
+    return <ProductPage />;
+  }
   return (
     <AuthGate>
       <Workspace />
