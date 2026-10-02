@@ -159,6 +159,7 @@ import {
   rescheduleBooking,
   updateCommercialActionMetadata,
   BookingConflictError,
+  isPlatformOwner,
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
 import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendWhatsAppMessage, _setWhatsAppHttp as setWhatsAppProviderHttp } from './channel-adapter.js';
@@ -523,6 +524,29 @@ async function requireAuth(req, res, next) {
   req.user = user;
   req.business = user.business;
   req.sessionId = session.id;
+  return next();
+}
+
+/**
+ * PLATFORM OWNER AUTHORIZATION (Phases 2-3)
+ *
+ * Must run AFTER requireAuth. The flag is authoritative ONLY from the
+ * database-loaded req.user record (populated by findUserById, which selects
+ * users.is_platform_owner). Nothing from the client is consulted: not
+ * req.body, not req.query, not JWT custom claims, not frontend state.
+ * There is no self-service elevation path — no endpoint writes this field.
+ *
+ *   unauthenticated            -> 401 (via requireAuth, never reaches here)
+ *   authenticated, not owner   -> 403
+ *   authenticated platform owner -> next()
+ */
+function requirePlatformOwner(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  if (!isPlatformOwner(req.user)) {
+    return res.status(403).json({ error: 'Platform owner access required' });
+  }
   return next();
 }
 
@@ -5778,6 +5802,375 @@ app.post('/v1/billing/cancel', asyncHandler(async (req, res) => {
     cancelledAt: nowPg(),
   });
   res.json({ subscription: await getPublicSubscription(req.business.id) });
+}));
+
+/**
+ * PLATFORM ADMIN API (Phase 3) — platform scope, NOT tenant scope.
+ *
+ * Every route here requires requireAuth + requirePlatformOwner. Queries
+ * intentionally span businesses via bounded, parameterized SQL with
+ * deterministic ordering. Serializers are explicit allowlists: no password
+ * hashes, tokens, session ids, payment secrets, or message bodies.
+ */
+const ADMIN_LIST_DEFAULT_LIMIT = 25;
+const ADMIN_LIST_MAX_LIMIT = 100;
+const ADMIN_LIST_MAX_OFFSET = 100000;
+
+const publicAdminUser = (row) => ({
+  id: row.id,
+  name: row.name,
+  email: row.email,
+  role: row.role,
+  createdAt: row.created_at,
+});
+
+const publicAdminBusiness = (row) => ({
+  businessId: row.business_id,
+  businessName: row.business_name,
+  slug: row.slug,
+  plan: row.plan || 'Free',
+  subscriptionStatus: row.subscription_status || 'active',
+  registrationDate: row.registration_date,
+  lastActivity: row.last_activity || null,
+  userCount: Number(row.user_count) || 0,
+  agentCount: Number(row.agent_count) || 0,
+  touchpointCount: Number(row.touchpoint_count) || 0,
+  productCount: Number(row.product_count) || 0,
+  leadCount: Number(row.lead_count) || 0,
+});
+
+// Phase 4A: allowlisted plan filter values (matches PLAN_LIMITS keys).
+const ADMIN_PLANS = ['Free', 'Starter', 'Growth', 'Business', 'Enterprise'];
+
+// Phase 4A: escape ILIKE wildcards so account search can only match literally.
+const escapeIlike = (value) => value.replace(/[\\%_]/g, (m) => `\\${m}`);
+
+// Phase 4A: per-business last activity derived ONLY from existing timestamp
+// columns (no fabricated timestamps). MAX ignores NULLs; falls back to the
+// business row itself when a business has no related rows yet.
+const ADMIN_LAST_ACTIVITY_SELECT = `(SELECT MAX(t) FROM (VALUES
+  (b.updated_at),
+  ((SELECT MAX(updated_at) FROM users WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM agents WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM touchpoints WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM products WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM leads WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM orders WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM bookings WHERE business_id = b.id)),
+  ((SELECT MAX(updated_at) FROM conversations WHERE business_id = b.id))
+) AS v(t)) AS last_activity`;
+
+async function queryAdminBusinessRow(businessId) {
+  const res = await pool.query(
+    `SELECT
+       b.id AS business_id,
+       b.name AS business_name,
+       b.slug AS slug,
+       COALESCE(s.plan, b.plan, 'Free') AS plan,
+       COALESCE(s.status, 'active') AS subscription_status,
+       b.created_at AS registration_date,
+       ${ADMIN_LAST_ACTIVITY_SELECT},
+       (SELECT COUNT(*)::int FROM users u WHERE u.business_id = b.id) AS user_count,
+       (SELECT COUNT(*)::int FROM agents a WHERE a.business_id = b.id) AS agent_count,
+       (SELECT COUNT(*)::int FROM touchpoints t WHERE t.business_id = b.id) AS touchpoint_count,
+       (SELECT COUNT(*)::int FROM products p WHERE p.business_id = b.id) AS product_count,
+       (SELECT COUNT(*)::int FROM leads l WHERE l.business_id = b.id) AS lead_count
+     FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     WHERE b.id = $1`,
+    [businessId]
+  );
+  return res.rows[0] || null;
+}
+
+app.get('/v1/admin/businesses', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const q = req.query || {};
+  const limit = parseIntParam(q.limit, { fallback: ADMIN_LIST_DEFAULT_LIMIT, min: 1, max: ADMIN_LIST_MAX_LIMIT });
+  if (limit === null) {
+    return res.status(400).json({ error: `limit must be an integer between 1 and ${ADMIN_LIST_MAX_LIMIT}` });
+  }
+  const offset = parseIntParam(q.offset, { fallback: 0, min: 0, max: ADMIN_LIST_MAX_OFFSET });
+  if (offset === null) {
+    return res.status(400).json({ error: `offset must be an integer between 0 and ${ADMIN_LIST_MAX_OFFSET}` });
+  }
+  // Phase 4A: optional allowlisted plan filter (backward compatible when absent).
+  let plan = null;
+  if (q.plan !== undefined && q.plan !== null && q.plan !== '') {
+    plan = String(q.plan);
+    if (!ADMIN_PLANS.includes(plan)) {
+      return res.status(400).json({ error: `plan must be one of: ${ADMIN_PLANS.join(', ')}` });
+    }
+  }
+  // Phase 4A: optional literal search over business name/slug (backward
+  // compatible when absent). Wildcards escaped; fully parameterized.
+  let search = null;
+  if (q.search !== undefined && q.search !== null && String(q.search).trim() !== '') {
+    search = String(q.search).trim().slice(0, 100);
+  }
+  const conditions = [];
+  const params = [];
+  if (plan) {
+    params.push(plan);
+    conditions.push(`COALESCE(s.plan, b.plan, 'Free') = $${params.length}`);
+  }
+  if (search) {
+    params.push(`%${escapeIlike(search)}%`);
+    conditions.push(`(b.name ILIKE $${params.length} OR b.slug ILIKE $${params.length})`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const rows = await pool.query(
+    `SELECT
+       b.id AS business_id,
+       b.name AS business_name,
+       b.slug AS slug,
+       COALESCE(s.plan, b.plan, 'Free') AS plan,
+       COALESCE(s.status, 'active') AS subscription_status,
+       b.created_at AS registration_date,
+       ${ADMIN_LAST_ACTIVITY_SELECT},
+       (SELECT COUNT(*)::int FROM users u WHERE u.business_id = b.id) AS user_count,
+       (SELECT COUNT(*)::int FROM agents a WHERE a.business_id = b.id) AS agent_count,
+       (SELECT COUNT(*)::int FROM touchpoints t WHERE t.business_id = b.id) AS touchpoint_count,
+       (SELECT COUNT(*)::int FROM products p WHERE p.business_id = b.id) AS product_count,
+       (SELECT COUNT(*)::int FROM leads l WHERE l.business_id = b.id) AS lead_count
+     FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     ${where}
+     ORDER BY b.created_at ASC, b.id ASC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  const countParams = params.slice(0, params.length - 2);
+  const totalRes = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     ${where}`,
+    countParams
+  );
+  res.status(200).json({
+    businesses: rows.rows.map(publicAdminBusiness),
+    total: totalRes.rows[0] ? totalRes.rows[0].n : rows.rows.length,
+    limit,
+    offset,
+  });
+}));
+
+app.get('/v1/admin/businesses/:id', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const businessId = typeof req.params.id === 'string' ? req.params.id : '';
+  if (!businessId || businessId.length > 200) {
+    return res.status(400).json({ error: 'business id is required' });
+  }
+  const row = await queryAdminBusinessRow(businessId);
+  if (!row) return res.status(404).json({ error: 'Business not found' });
+  const usersRes = await pool.query(
+    'SELECT id, name, email, role, created_at FROM users WHERE business_id = $1 ORDER BY created_at ASC, id ASC',
+    [businessId]
+  );
+  res.status(200).json({
+    business: publicAdminBusiness(row),
+    users: usersRes.rows.map(publicAdminUser),
+  });
+}));
+
+/**
+ * PHASE 4A ADMIN REPORTING — read-only platform aggregates.
+ *
+ * Every route below follows requireAuth -> requirePlatformOwner -> handler.
+ * All SELECT lists are explicit allowlists (never SELECT *); no password
+ * hashes, tokens, session ids, Paystack secrets, message bodies, or
+ * customer free text ever leave the database through these endpoints.
+ */
+
+// Platform overview: aggregate counts via SQL aggregates + plan distribution.
+app.get('/v1/admin/overview', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const counts = await pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM businesses) AS business_count,
+       (SELECT COUNT(*)::int FROM users) AS user_count,
+       (SELECT COUNT(*)::int FROM agents) AS agent_count,
+       (SELECT COUNT(*)::int FROM touchpoints) AS touchpoint_count,
+       (SELECT COUNT(*)::int FROM products) AS product_count,
+       (SELECT COUNT(*)::int FROM leads) AS lead_count,
+       (SELECT COUNT(*)::int FROM orders) AS order_count,
+       (SELECT COUNT(*)::int FROM bookings) AS booking_count`
+  );
+  const plansRes = await pool.query(
+    `SELECT COALESCE(s.plan, b.plan, 'Free') AS plan, COUNT(*)::int AS n
+     FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     GROUP BY COALESCE(s.plan, b.plan, 'Free')`
+  );
+  const plans = { Free: 0, Starter: 0, Growth: 0, Business: 0, Enterprise: 0 };
+  for (const row of plansRes.rows) {
+    if (Object.prototype.hasOwnProperty.call(plans, row.plan)) {
+      plans[row.plan] = row.n;
+    }
+  }
+  const c = counts.rows[0] || {};
+  res.status(200).json({
+    success: true,
+    overview: {
+      businessCount: Number(c.business_count) || 0,
+      userCount: Number(c.user_count) || 0,
+      agentCount: Number(c.agent_count) || 0,
+      touchpointCount: Number(c.touchpoint_count) || 0,
+      productCount: Number(c.product_count) || 0,
+      leadCount: Number(c.lead_count) || 0,
+      orderCount: Number(c.order_count) || 0,
+      bookingCount: Number(c.booking_count) || 0,
+    },
+    plans,
+  });
+}));
+
+// Platform users: registered application accounts only (no secrets).
+const publicAdminAccountUser = (row) => ({
+  id: row.id,
+  name: row.name,
+  email: row.email,
+  role: row.role,
+  businessId: row.business_id,
+  businessName: row.business_name,
+  emailVerified: row.email_verified === true,
+  createdAt: row.created_at,
+});
+
+app.get('/v1/admin/users', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const q = req.query || {};
+  const limit = parseIntParam(q.limit, { fallback: ADMIN_LIST_DEFAULT_LIMIT, min: 1, max: ADMIN_LIST_MAX_LIMIT });
+  if (limit === null) {
+    return res.status(400).json({ error: `limit must be an integer between 1 and ${ADMIN_LIST_MAX_LIMIT}` });
+  }
+  const offset = parseIntParam(q.offset, { fallback: 0, min: 0, max: ADMIN_LIST_MAX_OFFSET });
+  if (offset === null) {
+    return res.status(400).json({ error: `offset must be an integer between 0 and ${ADMIN_LIST_MAX_OFFSET}` });
+  }
+  let search = null;
+  if (q.search !== undefined && q.search !== null && String(q.search).trim() !== '') {
+    search = String(q.search).trim().slice(0, 100);
+  }
+  const conditions = [];
+  const params = [];
+  if (search) {
+    params.push(`%${escapeIlike(search)}%`);
+    conditions.push(`(u.name ILIKE $${params.length} OR u.email ILIKE $${params.length})`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const rows = await pool.query(
+    `SELECT u.id, u.name, u.email, u.role, u.business_id, b.name AS business_name,
+            u.email_verified, u.created_at
+     FROM users u
+     JOIN businesses b ON b.id = u.business_id
+     ${where}
+     ORDER BY u.created_at ASC, u.id ASC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  const countParams = params.slice(0, params.length - 2);
+  const totalRes = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM users u ${where}`,
+    countParams
+  );
+  res.status(200).json({
+    users: rows.rows.map(publicAdminAccountUser),
+    total: totalRes.rows[0] ? totalRes.rows[0].n : rows.rows.length,
+    limit,
+    offset,
+  });
+}));
+
+// Platform subscriptions: read-only plan/status reporting (no payment secrets).
+const publicAdminSubscription = (row) => ({
+  businessId: row.business_id,
+  businessName: row.business_name,
+  plan: row.plan || 'Free',
+  status: row.status || 'active',
+  currentPeriodEnd: row.current_period_end || null,
+});
+
+app.get('/v1/admin/subscriptions', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const q = req.query || {};
+  const limit = parseIntParam(q.limit, { fallback: ADMIN_LIST_DEFAULT_LIMIT, min: 1, max: ADMIN_LIST_MAX_LIMIT });
+  if (limit === null) {
+    return res.status(400).json({ error: `limit must be an integer between 1 and ${ADMIN_LIST_MAX_LIMIT}` });
+  }
+  const offset = parseIntParam(q.offset, { fallback: 0, min: 0, max: ADMIN_LIST_MAX_OFFSET });
+  if (offset === null) {
+    return res.status(400).json({ error: `offset must be an integer between 0 and ${ADMIN_LIST_MAX_OFFSET}` });
+  }
+  const rows = await pool.query(
+    `SELECT b.id AS business_id, b.name AS business_name,
+            COALESCE(s.plan, b.plan, 'Free') AS plan,
+            COALESCE(s.status, 'active') AS status,
+            s.current_period_end AS current_period_end
+     FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     ORDER BY b.created_at ASC, b.id ASC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  const totalRes = await pool.query('SELECT COUNT(*)::int AS n FROM businesses');
+  res.status(200).json({
+    subscriptions: rows.rows.map(publicAdminSubscription),
+    total: totalRes.rows[0] ? totalRes.rows[0].n : rows.rows.length,
+    limit,
+    offset,
+  });
+}));
+
+// Platform adoption report: compact per-business evidence dataset (no PII,
+// no conversation content, aggregate counts only).
+const publicAdminAdoptionRow = (row) => ({
+  businessId: row.business_id,
+  businessName: row.business_name,
+  registrationDate: row.registration_date,
+  plan: row.plan || 'Free',
+  userCount: Number(row.user_count) || 0,
+  agentCount: Number(row.agent_count) || 0,
+  touchpointCount: Number(row.touchpoint_count) || 0,
+  productCount: Number(row.product_count) || 0,
+  leadCount: Number(row.lead_count) || 0,
+  orderCount: Number(row.order_count) || 0,
+  bookingCount: Number(row.booking_count) || 0,
+});
+
+app.get('/v1/admin/reports/adoption', requireAuth, requirePlatformOwner, asyncHandler(async (req, res) => {
+  const q = req.query || {};
+  const limit = parseIntParam(q.limit, { fallback: ADMIN_LIST_DEFAULT_LIMIT, min: 1, max: ADMIN_LIST_MAX_LIMIT });
+  if (limit === null) {
+    return res.status(400).json({ error: `limit must be an integer between 1 and ${ADMIN_LIST_MAX_LIMIT}` });
+  }
+  const offset = parseIntParam(q.offset, { fallback: 0, min: 0, max: ADMIN_LIST_MAX_OFFSET });
+  if (offset === null) {
+    return res.status(400).json({ error: `offset must be an integer between 0 and ${ADMIN_LIST_MAX_OFFSET}` });
+  }
+  const rows = await pool.query(
+    `SELECT
+       b.id AS business_id,
+       b.name AS business_name,
+       b.created_at AS registration_date,
+       COALESCE(s.plan, b.plan, 'Free') AS plan,
+       (SELECT COUNT(*)::int FROM users u WHERE u.business_id = b.id) AS user_count,
+       (SELECT COUNT(*)::int FROM agents a WHERE a.business_id = b.id) AS agent_count,
+       (SELECT COUNT(*)::int FROM touchpoints t WHERE t.business_id = b.id) AS touchpoint_count,
+       (SELECT COUNT(*)::int FROM products p WHERE p.business_id = b.id) AS product_count,
+       (SELECT COUNT(*)::int FROM leads l WHERE l.business_id = b.id) AS lead_count,
+       (SELECT COUNT(*)::int FROM orders o WHERE o.business_id = b.id) AS order_count,
+       (SELECT COUNT(*)::int FROM bookings k WHERE k.business_id = b.id) AS booking_count
+     FROM businesses b
+     LEFT JOIN subscriptions s ON s.business_id = b.id
+     ORDER BY b.created_at ASC, b.id ASC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  const totalRes = await pool.query('SELECT COUNT(*)::int AS n FROM businesses');
+  res.status(200).json({
+    report: rows.rows.map(publicAdminAdoptionRow),
+    total: totalRes.rows[0] ? totalRes.rows[0].n : rows.rows.length,
+    limit,
+    offset,
+  });
 }));
 
 /**

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash           TEXT NOT NULL,
   name                    TEXT NOT NULL,
   role                    TEXT NOT NULL DEFAULT 'owner',
+  is_platform_owner       BOOLEAN NOT NULL DEFAULT FALSE,
   email_verified          BOOLEAN NOT NULL DEFAULT FALSE,
   verification_token      TEXT,
   verification_expires_at TIMESTAMPTZ,

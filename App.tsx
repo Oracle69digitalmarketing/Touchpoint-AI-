@@ -20,6 +20,7 @@ import { leadService } from './services/leads';
 import { billingService } from './services/billing';
 import AuthGate, { useAuth } from './components/AuthGate';
 import ProductPage from './components/ProductPage';
+import PlatformAdminPage from './components/PlatformAdminPage';
 
 /**
  * Public-route check for the buyer-facing product page.
@@ -34,9 +35,29 @@ export const isPublicProductRoute = (pathname: string): boolean => {
   return normalized === '/product';
 };
 
+/**
+ * Deliberate platform-owner route (Phase 4B).
+ *
+ * The Express SPA catch-all serves the same bundle for /admin, so matching
+ * the pathname here boots the control center. It stays inside <AuthGate> and
+ * the server remains authoritative: PlatformAdminPage renders only after
+ * GET /v1/admin/overview returns 200. No router dependency is introduced.
+ */
+export const isPlatformAdminRoute = (pathname: string): boolean => {
+  const normalized = pathname.replace(/\/+$/, '') || '/';
+  return normalized === '/admin' || normalized.startsWith('/admin/');
+};
+
 const App: React.FC = () => {
   if (typeof window !== 'undefined' && isPublicProductRoute(window.location.pathname)) {
     return <ProductPage />;
+  }
+  if (typeof window !== 'undefined' && isPlatformAdminRoute(window.location.pathname)) {
+    return (
+      <AuthGate>
+        <PlatformAdminPage />
+      </AuthGate>
+    );
   }
   return (
     <AuthGate>

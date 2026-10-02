@@ -111,23 +111,72 @@ export async function createUser({ id, businessId, email, passwordHash, name, ro
 }
 
 export async function findUserByEmail(email) {
-  const res = await pool.query(
-    'SELECT id, business_id, email, password_hash, name, role, email_verified, verification_token, verification_expires_at, created_at FROM users WHERE email = $1',
-    [email]
-  );
+  const res = await queryUsersByColumn('email', email, true);
   const user = res.rows[0];
   if (!user) return null;
-  return attachBusiness(user);
+  return attachBusiness(normalizePlatformFlag(user));
 }
 
 export async function findUserById(id) {
-  const res = await pool.query(
-    'SELECT id, business_id, email, password_hash, name, role, created_at FROM users WHERE id = $1',
-    [id]
-  );
+  const res = await queryUsersByColumn('id', id, false);
   const user = res.rows[0];
   if (!user) return null;
-  return attachBusiness(user);
+  return attachBusiness(normalizePlatformFlag(user));
+}
+
+/**
+ * PLATFORM OWNER IDENTITY (Phases 1-2)
+ *
+ * is_platform_owner is authoritative ONLY from the database and is loaded
+ * here so requireAuth callers can check it server-side. It is never read
+ * from the client, the JWT, or query/body params. The SELECT targets the
+ * new column but falls back to a legacy column list (flag FALSE) when the
+ * 011 migration has not been applied yet, so application boot never wedges
+ * on error 42703 (undefined_column) mid-deploy.
+ */
+const USER_COLUMNS_WITH_FLAG = {
+  withSecrets:
+    'id, business_id, email, password_hash, name, role, is_platform_owner, email_verified, verification_token, verification_expires_at, created_at',
+  public:
+    'id, business_id, email, password_hash, name, role, is_platform_owner, created_at',
+};
+
+const USER_COLUMNS_LEGACY = {
+  withSecrets:
+    'id, business_id, email, password_hash, name, role, email_verified, verification_token, verification_expires_at, created_at',
+  public:
+    'id, business_id, email, password_hash, name, role, created_at',
+};
+
+async function queryUsersByColumn(column, value, withSecrets) {
+  const key = withSecrets ? 'withSecrets' : 'public';
+  try {
+    return await pool.query(
+      `SELECT ${USER_COLUMNS_WITH_FLAG[key]} FROM users WHERE ${column} = $1`,
+      [value]
+    );
+  } catch (err) {
+    if (err && err.code === '42703') {
+      const res = await pool.query(
+        `SELECT ${USER_COLUMNS_LEGACY[key]} FROM users WHERE ${column} = $1`,
+        [value]
+      );
+      return res;
+    }
+    throw err;
+  }
+}
+
+function normalizePlatformFlag(user) {
+  return { ...user, is_platform_owner: user.is_platform_owner === true };
+}
+
+/**
+ * Returns TRUE only when the database-loaded user record carries the
+ * platform-owner flag. Never call this with client-supplied objects.
+ */
+export function isPlatformOwner(user) {
+  return !!user && user.is_platform_owner === true;
 }
 
 async function attachBusiness(user) {
