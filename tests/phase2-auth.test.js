@@ -50,6 +50,14 @@ const register = (payload) =>
 const login = (payload) =>
   request('/v1/auth/login', { method: 'POST', body: payload });
 
+// Test-only plan assignment: persists the plan the same way production
+// billing does (subscriptions row authoritative, businesses.plan mirrored).
+// The endpoint under test still derives the plan from req.business.plan.
+const setBusinessPlan = async (businessId, plan) => {
+  await testPool.query('UPDATE subscriptions SET plan = $1, status = $2 WHERE business_id = $3', [plan, 'active', businessId]);
+  await testPool.query('UPDATE businesses SET plan = $1 WHERE id = $2', [plan, businessId]);
+};
+
 test('health endpoint is public', async () => {
   const { status } = await request('/v1/health');
   assert.equal(status, 200);
@@ -115,6 +123,9 @@ test('password hashes are not stored or returned in plaintext', async () => {
 test('crm connections are scoped to the owning business (tenant isolation)', async () => {
   const acme = (await login({ email: 'owner@acme.co', password: 'password123' })).body;
 
+  // CRM Sync is a paid-plan capability: acme must be on Starter or higher.
+  await setBusinessPlan(acme.business.id, 'Starter');
+
   const connect = await request('/v1/crm/connect', {
     method: 'POST',
     body: { providerId: 'hubspot' },
@@ -143,6 +154,52 @@ test('crm connections are scoped to the owning business (tenant isolation)', asy
 
   const acmeStillHas = await request('/v1/crm/connections', { token: acme.token });
   assert.equal(acmeStillHas.body.connections.length, 1, 'acme crm untouched');
+});
+
+test('crm connect rejects Free workspaces with PLAN_FEATURE_RESTRICTED', async () => {
+  const fresh = (await register({
+    email: 'owner@free-crm.co',
+    password: 'password123',
+    name: 'Free Owner',
+    businessName: 'Free CRM Ltd',
+  })).body;
+
+  const denied = await request('/v1/crm/connect', {
+    method: 'POST',
+    body: { providerId: 'hubspot' },
+    token: fresh.token,
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.success, false);
+  assert.equal(denied.body.code, 'PLAN_FEATURE_RESTRICTED');
+  assert.equal(denied.body.requiredPlan, 'Starter');
+
+  const list = await request('/v1/crm/connections', { token: fresh.token });
+  assert.equal(list.status, 200);
+  assert.equal(list.body.connections.length, 0, 'no CRM connection was created');
+});
+
+test('crm connect allows Starter workspaces', async () => {
+  const paid = (await register({
+    email: 'owner@starter-crm.co',
+    password: 'password123',
+    name: 'Starter Owner',
+    businessName: 'Starter CRM Ltd',
+  })).body;
+
+  await setBusinessPlan(paid.business.id, 'Starter');
+
+  const connect = await request('/v1/crm/connect', {
+    method: 'POST',
+    body: { providerId: 'hubspot' },
+    token: paid.token,
+  });
+  assert.equal(connect.status, 200);
+  assert.equal(connect.body.success, true);
+
+  const list = await request('/v1/crm/connections', { token: paid.token });
+  assert.equal(list.body.connections.length, 1, 'the CRM connection exists');
+  assert.equal(list.body.connections[0].provider_id, 'hubspot');
 });
 
 test('logout revokes the session server-side', async () => {

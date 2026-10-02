@@ -13,7 +13,7 @@ export const PLAN_LIMITS = {
     touchpoints: 5,
     leads: 15,
     products: 5,
-    features: ['Basic Dashboard', 'Touchpoint Branding']
+    features: ['Basic Dashboard', 'Up to 1 AI agent', 'Up to 5 touchpoints', 'Up to 5 products', 'Up to 15 leads']
   },
   Starter: {
     price: { NGN: 7500, USD: 10 },
@@ -21,7 +21,7 @@ export const PLAN_LIMITS = {
     touchpoints: 50,
     leads: 100,
     products: 50,
-    features: ['CRM Sync', 'Lead Export (CSV)', 'WhatsApp/Email Alerts', 'No Branding']
+    features: ['CRM Sync', 'Up to 1 AI agent', 'Up to 50 touchpoints', 'Up to 50 products', 'Up to 100 leads']
   },
   Growth: {
     price: { NGN: 20000, USD: 25 },
@@ -29,7 +29,7 @@ export const PLAN_LIMITS = {
     touchpoints: 500,
     leads: 1000,
     products: 200,
-    features: ['Multi-user Access', 'Automation Engine', 'Advanced Analytics', 'Routing Rules']
+    features: ['Up to 5 AI agents', 'Up to 500 touchpoints', 'Up to 200 products', 'Up to 1,000 leads']
   },
   Business: {
     price: { NGN: 50000, USD: 60 },
@@ -37,7 +37,7 @@ export const PLAN_LIMITS = {
     touchpoints: 1000,
     leads: 5000,
     products: 500,
-    features: ['Role-based Permissions', 'Priority Support', 'Full Pipeline Mapping']
+    features: ['Up to 20 AI agents', 'Up to 1,000 touchpoints', 'Up to 500 products', 'Up to 5,000 leads']
   },
   Enterprise: {
     price: { NGN: -1, USD: -1 },
@@ -45,6 +45,6 @@ export const PLAN_LIMITS = {
     touchpoints: 5000,
     leads: 100000,
     products: 1000,
-    features: ['White-label', 'NFC Hardware Orchestration', 'Dedicated Support']
+    features: ['Up to 100 AI agents', 'Up to 5,000 touchpoints', 'Up to 1,000 products', 'Up to 100,000 leads']
   }
 };

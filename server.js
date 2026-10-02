@@ -2378,6 +2378,17 @@ app.get('/v1/crm/connections', requireAuth, asyncHandler(async (req, res) => {
 
 // Connect CRM
 app.post('/v1/crm/connect', requireAuth, asyncHandler(async (req, res) => {
+  // CRM Sync is a paid-plan capability. The plan is server-resolved
+  // (req.business.plan); nothing supplied in the request body is trusted.
+  if ((req.business.plan || 'Free') === 'Free') {
+    return res.status(403).json({
+      success: false,
+      error: 'CRM Sync requires the Starter plan or higher.',
+      code: 'PLAN_FEATURE_RESTRICTED',
+      requiredPlan: 'Starter',
+    });
+  }
+
   const { providerId } = req.body;
 
   if (!providerId) {
