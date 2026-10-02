@@ -230,7 +230,7 @@ const Settings: React.FC<Props> = ({
               {subscription === 'Free' && (
                 <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl text-amber-700 text-xs font-bold mb-4 flex items-center gap-2">
                   <AlertTriangle size={14} />
-                  CRM Sync requires a Professional or Enterprise subscription.
+                  CRM Sync requires the Starter plan or higher.
                 </div>
               )}
               {crms.map((crm) => (

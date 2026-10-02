@@ -198,7 +198,21 @@ class PaystackAdapter {
     const event = typeof parsed.event === 'string' ? parsed.event : null;
     const data = parsed.data && typeof parsed.data === 'object' && !Array.isArray(parsed.data) ? parsed.data : {};
 
-    const eventId = typeof data.id === 'string' && data.id ? data.id : null;
+    // I-2: same normalized identity as server.js normalizeWebhookEventId —
+    // top-level id first, then data.id, then doubly-wrapped data.data.id.
+    // Numbers (Paystack data.id) are stringified; anything else is null.
+    const normalizeId = (value) => {
+      if (typeof value === 'string' && value) return value;
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+      return null;
+    };
+    const eventId =
+      normalizeId(parsed.id) ??
+      normalizeId(parsed.event_id) ??
+      normalizeId(data.id) ??
+      normalizeId(data.event_id) ??
+      normalizeId(data.data && typeof data.data === 'object' ? data.data.id : null) ??
+      null;
     const providerReference = typeof data.reference === 'string' && data.reference ? data.reference : null;
     const amountMinor = Number.isInteger(data.amount) ? data.amount : null;
     const currency = typeof data.currency === 'string' && data.currency ? data.currency.toUpperCase() : null;

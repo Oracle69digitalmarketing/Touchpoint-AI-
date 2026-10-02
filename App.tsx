@@ -173,7 +173,7 @@ const Workspace: React.FC = () => {
 
   const handleConnectCRM = async (id: string) => {
     if (subscription === 'Free') {
-      alert('CRM Sync is a Professional feature. Please upgrade your plan.');
+      alert('CRM Sync is a Starter feature. Please upgrade your plan.');
       setActiveTab('settings');
       return;
     }

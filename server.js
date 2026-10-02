@@ -50,6 +50,7 @@ import {
   createSession,
   findSession,
   revokeSession,
+  revokeUserSessions,
   createResetToken,
   findResetToken,
   consumeResetToken,
@@ -121,10 +122,10 @@ import {
   createPaystackTransaction,
   getPaystackTransaction,
   setPaystackTransactionFinalStatus,
-  hasWebhookEvent,
   recordWebhookEvent,
   createOrderRecord,
   getOrderById,
+  getPaymentIntentByReference,
   listOrders,
   listOrdersByConversation,
   setOrderStatus,
@@ -164,7 +165,7 @@ import {
 import { PLAN_LIMITS } from './plan-limits.js';
 import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendWhatsAppMessage, _setWhatsAppHttp as setWhatsAppProviderHttp } from './channel-adapter.js';
 import { initializeOrderPayment, handleProviderWebhook } from './payment-service.js';
-import { _setPaystackHttp as setPaymentProviderHttp } from './payment-provider.js';
+import { getProvider, _setPaystackHttp as setPaymentProviderHttp } from './payment-provider.js';
 import {
   availableSlots as bookingAvailableSlots,
   isExactSlot as bookingIsExactSlot,
@@ -360,7 +361,7 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '100kb', verify: rawBodyC
 // be throttled by the user-facing generic limiter — its security is the
 // X-Hub-Signature-256 check, not an IP counter — and it has its own dedicated
 // high-ceiling limiter below.
-const API_LIMITER_SKIP_PATHS = ['/v1/health', '/v1/channel/whatsapp/webhook'];
+const API_LIMITER_SKIP_PATHS = ['/v1/health', '/v1/channel/whatsapp/webhook', '/v1/payments/webhook'];
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -743,6 +744,9 @@ app.post('/v1/auth/reset-password', asyncHandler(async (req, res) => {
   const passwordHash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
   await updateUserPassword(resetToken.user_id, passwordHash);
   await consumeResetToken(resetToken.id);
+  // A credential change invalidates every previously-issued session so a
+  // compromised session can never outlive the reset.
+  await revokeUserSessions(resetToken.user_id);
 
   res.json({ message: 'Password updated successfully' });
 }));
@@ -760,7 +764,6 @@ app.post('/v1/auth/reset-password', asyncHandler(async (req, res) => {
  * amount/currency/plan code against what the server recorded.
  */
 
-const BILLABLE_PLANS = ['Starter', 'Growth', 'Business'];
 const PAYSTACK_CURRENCIES = ['NGN', 'USD'];
 const PAYSTACK_PLAN_CODE_ENV = {
   Starter: 'PAYSTACK_PLAN_CODE_STARTER',
@@ -787,6 +790,37 @@ function verifyPaystackSignature(rawBody, signature) {
   const b = Buffer.from(signature, 'hex');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * I-2: Normalize the Paystack webhook event ID consistently before dedup.
+ *
+ * The application has historically represented the event ID in two places:
+ *   - top-level `event.id` (legacy `/v1/billing/webhook` payloads/tests);
+ *   - nested `data.id` (unified `/v1/payments/webhook` + provider parser).
+ * Real Paystack deliveries carry a numeric `data.id`; tests use string ids.
+ * This helper returns ONE canonical string id using only those existing
+ * locations (plus a safe `data.data.id` fallback for doubly-wrapped bodies):
+ *   event.id ?? data.id ?? data.data.id
+ * Numbers are stringified; anything else yields null (no dedup possible).
+ * No new identity scheme is invented.
+ */
+function normalizeWebhookEventId(event, data) {
+  const candidates = [];
+  if (event && typeof event === 'object') {
+    candidates.push(event.id, event.event_id, event.eventId);
+  }
+  if (data && typeof data === 'object') {
+    candidates.push(data.id, data.event_id, data.eventId);
+    if (data.data && typeof data.data === 'object') {
+      candidates.push(data.data.id, data.data.event_id);
+    }
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate) return candidate;
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return String(candidate);
+  }
+  return null;
 }
 
 /**
@@ -866,6 +900,11 @@ async function applySuccessfulCharge({ transaction, payload }) {
   }
 
   const eventPlanCode = payload.plan && payload.plan.plan_code;
+  // Phase 13 I-3 (intentional): recurring reconciliation validates plan code
+  // and currency but NOT exact amount equality, preserving legitimate
+  // proration/discount/billing variation. Exact amounts are enforced for
+  // one-time charges above. Do not tighten this without evidence of a
+  // concrete security or correctness defect.
   if (current.plan_code && eventPlanCode && eventPlanCode !== current.plan_code) {
     console.warn(`[Billing] Plan code mismatch for ${current.reference}`);
     await setPaystackTransactionFinalStatus(current.reference, 'failed', { event: 'charge.success', error: 'plan_code_mismatch' });
@@ -915,46 +954,65 @@ async function markChargeFailed(reference, status, event, error) {
  *   - charge.success            -> entitlement granted (after cross-checks);
  *   - subscription lifecycle    -> cancellation / expiry persisted.
  */
-app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
-  const signature = req.headers['x-paystack-signature'];
-  if (!verifyPaystackSignature(req.rawBody, signature)) {
-    return res.status(401).json({ error: 'Invalid webhook signature' });
-  }
-
-  const event = req.body || {};
-  const eventType = typeof event.event === 'string' ? event.event : '';
-  const eventId = typeof event.id === 'string' ? event.id : null;
-  const data = event.data || {};
-
-  if (eventId && await hasWebhookEvent(eventId)) {
-    return res.json({ received: true, duplicate: true });
-  }
+/**
+ * Handles a signature-verified Paystack subscription/billing event.
+ *
+ * Shared by BOTH webhook endpoints (the legacy /v1/billing/webhook and the
+ * Phase 13E unified /v1/payments/webhook) so subscription handling has exactly
+ * one implementation. Every cross-check is against server-recorded values; an
+ * unknown reference or event type never grants anything. Idempotent and safe
+ * to run twice: the shared webhook_events ledger dedups per event id.
+ *
+ * Returns the JSON body for a 200 acknowledgement.
+ */
+async function handlePaystackSubscriptionEvent({ eventType, eventId, data }) {
+  // I-2: ONE normalized id for every has/record decision in this handler.
+  // Callers already normalize; this re-normalization also covers direct callers
+  // that pass a raw top-level id plus a data payload carrying data.id.
+  const eid = normalizeWebhookEventId({ id: eventId }, data);
+  // I-1: record-first claim. INSERT ... ON CONFLICT DO NOTHING is atomic;
+  // false (with a non-null id) means another request already claimed this
+  // event, so we must NOT apply it again. A null id cannot be deduped and
+  // proceeds without a ledger claim (existing behavior).
+  const claimOrDuplicate = async (businessId) => {
+    if (!eid) return null;
+    const claimed = await recordWebhookEvent({ eventId: eid, eventType, businessId: businessId ?? null });
+    return claimed ? null : { received: true, duplicate: true };
+  };
 
   if (eventType === 'charge.success') {
     const reference = typeof data.reference === 'string' ? data.reference : '';
     const transaction = reference ? await getPaystackTransaction(reference) : null;
     if (!transaction) {
-      await recordWebhookEvent({ eventId, eventType });
-      return res.json({ received: true, ignored: 'unknown_reference' });
+      const duplicate = await claimOrDuplicate(null);
+      if (duplicate) return duplicate;
+      return { received: true, ignored: 'unknown_reference' };
     }
     const metadataBusinessId = data.metadata && data.metadata.business_id;
     if (metadataBusinessId && metadataBusinessId !== transaction.business_id) {
-      await recordWebhookEvent({ eventId, eventType });
-      return res.json({ received: true, ignored: 'metadata_mismatch' });
+      const duplicate = await claimOrDuplicate(null);
+      if (duplicate) return duplicate;
+      return { received: true, ignored: 'metadata_mismatch' };
+    }
+    {
+      const duplicate = await claimOrDuplicate(transaction.business_id);
+      if (duplicate) return duplicate;
     }
     await applySuccessfulCharge({ transaction, payload: data });
-    await recordWebhookEvent({ eventId, eventType, businessId: transaction.business_id });
-    return res.json({ received: true, subscription: await getPublicSubscription(transaction.business_id) });
+    return { received: true, subscription: await getPublicSubscription(transaction.business_id) };
   }
 
   if (CHARGE_FAILED_EVENTS.includes(eventType)) {
     const reference = typeof data.reference === 'string' ? data.reference : '';
     const transaction = reference ? await getPaystackTransaction(reference) : null;
+    {
+      const duplicate = await claimOrDuplicate(transaction ? transaction.business_id : null);
+      if (duplicate) return duplicate;
+    }
     if (transaction) {
       await markChargeFailed(reference, eventType === 'charge.abandoned' ? 'abandoned' : 'failed', eventType);
     }
-    await recordWebhookEvent({ eventId, eventType, businessId: transaction ? transaction.business_id : null });
-    return res.json({ received: true });
+    return { received: true };
   }
 
   if (SUBSCRIPTION_LIFECYCLE_EVENTS.includes(eventType)) {
@@ -967,15 +1025,18 @@ app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
       const emailToken = data.email_token || null;
       const byCustomer = customerCode ? await findSubscriptionByCustomerCode(customerCode) : null;
       if (byCustomer) {
+        const duplicate = await claimOrDuplicate(byCustomer.business_id);
+        if (duplicate) return duplicate;
         await upsertSubscription(byCustomer.business_id, {
           paystackSubscriptionCode: subscriptionCode || undefined,
           paystackPlanCode: planCode || undefined,
           paystackEmailToken: emailToken || undefined,
         });
-        await recordWebhookEvent({ eventId, eventType, businessId: byCustomer.business_id });
-        return res.json({ received: true });
+        return { received: true };
       }
     } else if (subscription) {
+      const duplicate = await claimOrDuplicate(subscription.business_id);
+      if (duplicate) return duplicate;
       if (eventType === 'subscription.disable') {
         await upsertSubscription(subscription.business_id, { status: 'cancelled', cancelledAt: nowPg() });
       } else if (eventType === 'subscription.expired') {
@@ -983,16 +1044,35 @@ app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
       } else if (eventType === 'subscription.not_renew') {
         await upsertSubscription(subscription.business_id, { status: 'not_renewing' });
       }
-      await recordWebhookEvent({ eventId, eventType, businessId: subscription.business_id });
-      return res.json({ received: true });
+      return { received: true };
     }
 
-    await recordWebhookEvent({ eventId, eventType, businessId: subscription ? subscription.business_id : null });
-    return res.json({ received: true });
+    {
+      const duplicate = await claimOrDuplicate(subscription ? subscription.business_id : null);
+      if (duplicate) return duplicate;
+    }
+    return { received: true };
   }
 
-  await recordWebhookEvent({ eventId, eventType });
-  res.json({ received: true });
+  {
+    const duplicate = await claimOrDuplicate(null);
+    if (duplicate) return duplicate;
+  }
+  return { received: true };
+}
+
+app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
+  const signature = req.headers['x-paystack-signature'];
+  if (!verifyPaystackSignature(req.rawBody, signature)) {
+    return res.status(401).json({ error: 'Invalid webhook signature' });
+  }
+
+  const event = req.body || {};
+  const eventType = typeof event.event === 'string' ? event.event : '';
+  const data = event.data || {};
+  const eventId = normalizeWebhookEventId(event, data);
+
+  res.status(200).json(await handlePaystackSubscriptionEvent({ eventType, eventId, data }));
 }));
 
 /**
@@ -4661,12 +4741,68 @@ async function emitPaymentOutcomeEvents(outcome) {
 }
 
 /**
- * The ONLY unauthenticated place payment status can change, and only after
- * HMAC signature verification. Idempotency comes from the webhook-event ledger
- * (ON CONFLICT DO NOTHING); settlement from atomic compare-and-set. Unknown
- * references ack 200 benevolently (no existence oracle).
+ * The ONLY unauthenticated place payment status can change. Phase 13E (A2)
+ * turned this into the single Paystack webhook endpoint for BOTH pipelines:
+ *
+ *   1. provider             -> validated up front (unknown providers are 400);
+ *   2. HMAC-SHA512 signature -> 401 before anything is read or routed;
+ *   3. event-id dedup        -> the shared webhook_events ledger (both paths);
+ *   4. reference dispatch    -> server-recorded references ONLY:
+ *        - reference resolves to a payment_intent   -> order settlement
+ *          (unchanged payment pipeline, atomic compare-and-set);
+ *        - reference resolves to a legitimate
+ *          subscription transaction (or the event is
+ *          a subscription lifecycle event)          -> subscription handling
+ *          (same implementation as /v1/billing/webhook);
+ *        - anything else                             -> benign 200, never
+ *          settles or grants anything.
+ *
+ * Payment intent references (TPO-) and subscription transaction references
+ * (TXP-) come from disjoint namespaces and are resolved against DB rows, never
+ * from body fields, so a reference that resembles another resource can never
+ * cross-route. A subscription event can never settle an order unless its
+ * reference resolves to a real payment_intent.
  */
 app.post('/v1/payments/webhook/:provider', asyncHandler(async (req, res) => {
+  // Provider registry: unknown providers are rejected before any parsing.
+  let adapter;
+  try {
+    adapter = getProvider(req.params.provider);
+  } catch (error) {
+    if (error.name === 'ProviderError') {
+      const status = error.status === 404 ? 400 : (error.status >= 500 ? error.status : 502);
+      return res.status(status).json({ error: error.message });
+    }
+    throw error;
+  }
+
+  // Authenticity first: nothing below is trusted until the HMAC passes.
+  const signature = req.headers['x-paystack-signature'];
+  if (!verifyPaystackSignature(req.rawBody, signature)) {
+    return res.status(401).json({ error: 'Invalid webhook signature' });
+  }
+
+  const event = req.body || {};
+  const eventType = typeof event.event === 'string' ? event.event : '';
+  const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? event.data : {};
+  const eventId = normalizeWebhookEventId(event, data);
+  const reference = typeof data.reference === 'string' && data.reference ? data.reference : null;
+
+  const isSubscriptionEvent =
+    SUBSCRIPTION_LIFECYCLE_EVENTS.includes(eventType) ||
+    (reference &&
+      ['charge.success', 'charge.failed', 'charge.abandoned'].includes(eventType) &&
+      !(await getPaymentIntentByReference(adapter.name, reference)) &&
+      !!(await getPaystackTransaction(reference)));
+
+  if (isSubscriptionEvent) {
+    const result = await handlePaystackSubscriptionEvent({ eventType, eventId, data });
+    return res.status(200).json(result);
+  }
+
+  // Order-payment pipeline (unchanged, single authority). The HMAC is verified
+  // once more inside before parsing; unknown references ack 200 benevolently
+  // (no existence oracle).
   try {
     const result = await handleProviderWebhook({
       providerName: req.params.provider,
@@ -6232,8 +6368,9 @@ if (isMainModule) {
   });
 
   // Graceful shutdown: stop accepting connections and close the database pool
-  // so no in-flight queries are abandoned.
-  const shutdown = (signal) => {
+  // so no in-flight queries are abandoned. `exitCode` is 0 for clean signals
+  // and 1 for the fatal uncaughtException path.
+  const shutdown = (signal, exitCode = 0) => {
     console.log(`\n[Server] Received ${signal}, shutting down gracefully...`);
     server.close(() => {
       try {
@@ -6241,13 +6378,38 @@ if (isMainModule) {
       } catch (err) {
         console.error('[Server] Error closing database:', err.message);
       }
-      process.exit(0);
+      process.exit(exitCode);
     });
     // If connections refuse to drain, force exit after 10 seconds.
-    setTimeout(() => process.exit(1), 10000).unref();
+    setTimeout(() => process.exit(exitCode), 10000).unref();
   };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+  process.on('SIGINT', () => shutdown('SIGINT', 0));
+
+  // Phase 13E (F1): process-level error lifecycle. A stray promise rejection
+  // (e.g. a background WhatsApp send or background funnel emit) must never
+  // crash the process and drop in-flight webhooks, so it is logged and the
+  // process keeps serving. An uncaught synchronous exception, by contrast, is
+  // fatal: initiate the same graceful shutdown but exit non-zero. Both paths
+  // log only the error's own fields (name/message/stack) — never request
+  // bodies, headers, or configuration, so secrets cannot leak through here.
+  const safeErrorDescription = (err) => {
+    if (err instanceof Error) {
+      return `\n  name: ${err.name}\n  message: ${err.message}\n  stack: ${err.stack || '(no stack)'}`;
+    }
+    if (err === undefined || err === null) return '(empty rejection)';
+    return `\n  value: ${JSON.stringify(err)}`;
+  };
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[Process] Unhandled promise rejection (logged; not crashing):', safeErrorDescription(reason));
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('[Process] Uncaught exception:', safeErrorDescription(err));
+    console.error('[Process] Shutting down gracefully and exiting with status 1...');
+    shutdown('uncaughtException', 1);
+  });
 }
 
 export default app;

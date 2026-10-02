@@ -31,9 +31,14 @@ export async function pingDatabase() {
 }
 
 /**
- * Closes the pool.
+ * Closes the pool. Idempotent: calling this more than once never calls
+ * pool.end() again (a second pool.end() throws "Called end on pool more than
+ * once") and never re-enters shutdown.
  */
+let poolClosed = false;
 export async function closeDatabase() {
+  if (poolClosed) return;
+  poolClosed = true;
   await pool.end();
 }
 
@@ -214,6 +219,17 @@ export async function revokeSession(id) {
 }
 
 /**
+ * Revokes every live session for a user (used after a password reset so a
+ * compromised session can never survive a credential change).
+ */
+export async function revokeUserSessions(userId) {
+  await pool.query(
+    'UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND revoked_at IS NULL',
+    [userId]
+  );
+}
+
+/**
  * SUBSCRIPTION & BILLING STORAGE
  */
 
@@ -258,6 +274,11 @@ export async function resolveSubscription(subscription) {
   if (status === 'expired') {
     effectivePlan = 'Free';
   } else if (status === 'cancelled' || status === 'not_renewing') {
+    // Policy A (Phase 13 I-4): cancellation ends renewal, not the paid
+    // entitlement. A cancelled subscription stays effective until its known
+    // current_period_end. A NULL period end is an anomalous edge state: never
+    // invent an expiry date and never silently downgrade to Free here — leave
+    // the resolver behavior intact and surface the row via admin reporting.
     const periodEnd = subscription.current_period_end ? new Date(subscription.current_period_end) : null;
     if (periodEnd && periodEnd.getTime() <= Date.now()) {
       effectiveStatus = 'expired';
@@ -2410,6 +2431,12 @@ export async function transitionBooking(businessId, id, { to, from, patch = null
     sql += `, metadata = COALESCE(metadata, '{}'::jsonb) || $${params.length}::jsonb`;
   }
   sql += ` WHERE business_id = $1 AND id = $2 AND status = ANY($4)`;
+  sql += ` AND NOT (
+      status = 'reserved'
+      AND $3 = 'confirmed'
+      AND hold_until IS NOT NULL
+      AND hold_until <= CURRENT_TIMESTAMP
+    )`;
   const res = await pool.query(sql, params);
   if (res.rowCount === 0) return null;
   return getBooking(businessId, id);
@@ -2441,7 +2468,7 @@ export async function rescheduleBooking({
   businessId, bookingId, config, newSlot,
   requireStatuses = ['reserved', 'confirmed'], now = new Date(),
 }) {
-  const lockKey = `${businessId}:${newSlot.start.toISOString()}`;
+  const lockKey = `${businessId}:${newSlot.productId}:${newSlot.start.toISOString()}`;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -2458,6 +2485,13 @@ export async function rescheduleBooking({
     }
     const current = cur.rows[0];
     if (!requireStatuses.includes(current.status)) {
+      await client.query('ROLLBACK');
+      return { booking: null, moved: false };
+    }
+    // Expired reserved holds no longer own the slot: the booking cannot be
+    // moved to a new slot (or renewed) once its hold window has elapsed. The
+    // expiry must be surfaced as a failed transition, not silently renewed.
+    if (current.status === 'reserved' && current.hold_until && new Date(current.hold_until).getTime() <= now.getTime()) {
       await client.query('ROLLBACK');
       return { booking: null, moved: false };
     }
