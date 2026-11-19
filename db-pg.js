@@ -2554,3 +2554,394 @@ export async function updateCommercialActionMetadata(businessId, id, patch) {
   );
   return res.rowCount > 0;
 }
+
+/**
+ * Create (or refresh) a suppression entry for a canonical lowercase
+ * address. Returns { row, created } where created=false means refresh.
+ */
+export async function addEmailSuppression({ email, reason, detail = null, source = 'admin' }) {
+  const canonical = String(email || '').trim().toLowerCase();
+  if (!canonical) throw new Error('addEmailSuppression: email required');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO email_suppressions (id, email, reason, detail, source)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (email) DO NOTHING RETURNING email`,
+      [crypto.randomUUID(), canonical, reason, detail, source]
+    );
+    if (ins.rowCount > 0) {
+      await client.query('COMMIT');
+      return { row: ins.rows[0], created: true };
+    }
+    const upd = await client.query(
+      `UPDATE email_suppressions
+          SET reason = $1,
+              detail = COALESCE($2, email_suppressions.detail),
+              source = $3
+        WHERE email = $4
+        RETURNING *`,
+      [reason, detail, source, canonical]
+    );
+    await client.query('COMMIT');
+    return { row: upd.rows[0], created: false };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Apply a verified provider lifecycle event to the outbox row.
+ * Returns true when a row was updated.
+ */
+export async function applyEmailEventToMessage(resendId, eventType) {
+  const mapping = {
+    sent: ['sent', 'sent_at'],
+    delivered: ['delivered', 'delivered_at'],
+    opened: ['opened', 'opened_at'],
+    clicked: ['clicked', 'clicked_at'],
+    bounced: ['bounced', 'bounced_at'],
+    failed: ['failed', 'failed_at'],
+  };
+  const m = mapping[eventType];
+  if (!m) return { updated: false };
+  const [status, tsCol] = m;
+  const extra = eventType === 'failed' ? ', error_count = error_count + 1' : '';
+  const res = await pool.query(
+    `UPDATE email_messages
+       SET status = $1, ${tsCol} = CURRENT_TIMESTAMP${extra}
+         , updated_at = CURRENT_TIMESTAMP
+     WHERE resend_id = $2 AND status NOT IN ('bounced', 'failed', 'suppressed')`,
+    [status, resendId]
+  );
+  return { updated: res.rowCount > 0 };
+}
+
+/**
+ * Enqueue a unit of restart-safe email work. Two kinds share the queue:
+ *   lead_followup  — reminder set scheduled at +30/+60/+1440 min after a
+ *                    lead is assigned or its activity changes. The caller
+ *                    passes a stable dedupeKey (e.g. lead:<id>:<stage>); the
+ *                    partial unique index makes repeats a no-op.
+ *   outbox_retry   — redelivery attempt for a failed email_messages row.
+ * Returns { job, created }.
+ */
+export async function scheduleEmailJob({
+  businessId = null,
+  kind,
+  refId = null,
+  dedupeKey = null,
+  dueAt,
+  payload = {},
+}) {
+  const id = crypto.randomUUID();
+  let res;
+  if (kind === 'lead_followup') {
+    res = await pool.query(
+      `INSERT INTO email_jobs
+         (id, business_id, kind, ref_id, dedupe_key, due_at, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (dedupe_key)
+         WHERE kind = 'lead_followup' AND dedupe_key IS NOT NULL DO NOTHING`,
+      [id, businessId, kind, refId, dedupeKey, dueAt, JSON.stringify(payload)]
+    );
+  } else {
+    res = await pool.query(
+      `INSERT INTO email_jobs
+         (id, business_id, kind, ref_id, dedupe_key, due_at, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, businessId, kind, refId, dedupeKey, dueAt, JSON.stringify(payload)]
+    );
+  }
+  if (res.rowCount > 0) return { job: res.rows[0], created: true };
+  if (kind === 'lead_followup' && dedupeKey) {
+    const sel = await pool.query(
+      'SELECT * FROM email_jobs WHERE kind = $1 AND dedupe_key = $2',
+      [kind, dedupeKey]
+    );
+    if (sel.rows[0]) return { job: sel.rows[0], created: false };
+  }
+  return { job: null, created: false };
+}
+
+/**
+ * Claim due jobs for execution. The SELECT ... FOR UPDATE SKIP LOCKED +
+ * status flip happen in one transaction, so concurrent pollers/instances
+ * can never double-execute a job. Returns full rows (payload included).
+ */
+export async function claimDueEmailJobs({ limit = 10 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 50);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sel = await client.query(
+      `SELECT id, business_id, kind, ref_id, dedupe_key, due_at,
+              attempts + 1 AS attempts, payload
+         FROM email_jobs
+        WHERE status = 'scheduled' AND due_at <= NOW()
+        ORDER BY due_at ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED`,
+      [safeLimit]
+    );
+    const claimed = [];
+    for (const row of sel.rows) {
+      await client.query(
+        `UPDATE email_jobs
+            SET status = 'running', attempts = attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1`,
+        [row.id]
+      );
+      claimed.push(row);
+    }
+    await client.query('COMMIT');
+    return claimed;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Mark a claimed job as done (terminal).
+ */
+export async function markEmailJobDone(id) {
+  const res = await pool.query(
+    `UPDATE email_jobs SET status = 'done', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [id]
+  );
+  return res.rowCount > 0;
+}
+
+/**
+ * Record a failed execution. Jobs retry with exponential backoff
+ * (2^attempts minutes, capped at 640) until EMAIL_JOB_MAX_ATTEMPTS,
+ * after which they are cancelled permanently. Returns { status, cancelled }
+ * so the caller can alert exactly once on final failure.
+ */
+export const EMAIL_JOB_MAX_ATTEMPTS = 8;
+
+export async function markEmailJobFailed(id, errorMessage) {
+  const safeMsg = String(errorMessage || '').slice(0, 500);
+  const res = await pool.query(
+    `UPDATE email_jobs
+        SET status = CASE WHEN attempts >= $2 THEN 'cancelled' ELSE 'scheduled' END,
+            cancel_reason = CASE WHEN attempts >= $2 THEN 'max_attempts' ELSE NULL END,
+            last_error = $3,
+            due_at = CASE
+              WHEN attempts >= $2 THEN due_at
+              ELSE NOW() + make_interval(mins => LEAST(POWER(2, attempts), 640)::int)
+            END,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING status`,
+    [id, EMAIL_JOB_MAX_ATTEMPTS, safeMsg]
+  );
+  const status = res.rows[0] ? res.rows[0].status : null;
+  return { status, cancelled: status === 'cancelled' };
+}
+
+/**
+ * Admin listing of queue rows (pending/running/done/cancelled).
+ */
+export async function listEmailJobs({
+  businessId = null,
+  status = null,
+  kind = null,
+  limit = 100,
+  offset = 0,
+} = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const safeOffset = Math.max(Number(offset) || 0, 0);
+  const clauses = [];
+  const params = [];
+  if (businessId) {
+    params.push(businessId);
+    clauses.push(`business_id = $${params.length}`);
+  }
+  if (status) {
+    params.push(status);
+    clauses.push(`status = $${params.length}`);
+  }
+  if (kind) {
+    params.push(kind);
+    clauses.push(`kind = $${params.length}`);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  params.push(safeLimit, safeOffset);
+  const res = await pool.query(
+    `SELECT * FROM email_jobs ${where}
+     ORDER BY due_at ASC NULLS LAST, created_at ASC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  return res.rows;
+}
+
+/**
+ * Cancel not-yet-run work for a reference (e.g. pending follow-ups when a
+ * lead is converted, or retry jobs when an outbox row is suppressed).
+ * Only 'scheduled' rows are cancellable; 'running' jobs finish their pass.
+ * Returns the count cancelled.
+ */
+export async function cancelScheduledEmailJobs({ businessId = null, kind = null, refId = null }) {
+  if (!refId && !businessId && !kind) {
+    throw new Error('cancelScheduledEmailJobs: provide at least one of refId, businessId, kind');
+  }
+  const clauses = ["status = 'scheduled'"];
+  const params = [];
+  if (businessId) {
+    params.push(businessId);
+    clauses.push(`business_id = $${params.length}`);
+  }
+  if (kind) {
+    params.push(kind);
+    clauses.push(`kind = $${params.length}`);
+  }
+  if (refId) {
+    params.push(refId);
+    clauses.push(`ref_id = $${params.length}`);
+  }
+  params.push('superseded');
+  const res = await pool.query(
+    `UPDATE email_jobs SET status = 'cancelled', cancel_reason = $${params.length}, updated_at = CURRENT_TIMESTAMP WHERE ${clauses.join(' AND ')}`,
+    params
+  );
+  return res.rowCount;
+}
+
+/**
+ * Recent send counter for DB-backed per-account rate limiting (WS1): counts
+ * outbox rows for a recipient+category inside the trailing window. Used by
+ * the resend-verification endpoint so the limit survives restarts and is
+ * testable without process-local state.
+ */
+export async function countRecentEmails({ recipient, category, withinHours = 1 }) {
+  const res = await pool.query(
+    `SELECT COUNT(*)::int AS count
+       FROM email_messages
+      WHERE recipient = $1 AND category = $2
+        AND created_at > NOW() - make_interval(hours => $3)`,
+    [String(recipient || '').trim().toLowerCase(), category, withinHours]
+  );
+  return res.rows[0].count;
+}
+
+/**
+ * Reissue a user's verification token (single UPDATE, CAS on email_verified
+ * so a concurrent verify-login never races a resend). Returns the new raw
+ * token, or null when the user was already verified in the same instant.
+ */
+export async function reissueVerificationToken(userId, rawToken, expiresAt) {
+  const res = await pool.query(
+    `UPDATE users
+        SET verification_token = $2,
+            verification_expires_at = $3,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1 AND email_verified = FALSE
+      RETURNING id`,
+    [userId, rawToken, expiresAt]
+  );
+  return res.rowCount > 0 ? rawToken : null;
+}
+
+/**
+ * Remove a suppression row (admin un-suppress). Returns the number of rows
+ * deleted (0 or 1; email is UNIQUE). Deleting a row re-enables sending for
+ * that address on the next sendEmail() call.
+ */
+export async function deleteEmailSuppression(email) {
+  const canonical = String(email || '').trim().toLowerCase();
+  if (!canonical) return 0;
+  const res = await pool.query('DELETE FROM email_suppressions WHERE email = $1', [canonical]);
+  return res.rowCount || 0;
+}
+
+/**
+ * Record a new outbox message and return { row, created }. The `id` field
+ * is always ensured on the returned row so that downstream code that reads
+ * it (e.g. undefined "id" checks) does not throw.
+ */
+export async function recordEmailMessage({
+  businessId,
+  kind,
+  recipient,
+  category,
+  payload = {},
+  sendAt = null,
+  resendId = null,
+}) {
+  const id = crypto.randomUUID();
+  const res = await pool.query(
+    `INSERT INTO email_messages
+         (id, business_id, kind, recipient, category, payload, send_at, resend_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+    [id, businessId || null, kind || 'outbox', String(recipient || '').trim().toLowerCase(),
+     category || 'outbox', JSON.stringify(payload), sendAt, resendId || null]
+  );
+  if (res.rows[0]) {
+    // Ensure id is always present on the returned row (defensive)
+    res.rows[0].id = id;
+  }
+  return { row: res.rows[0], created: true };
+}
+
+/**
+ * Fetch a single outbox row by its DB primary key.
+ */
+export async function getEmailMessage(id) {
+  if (!id) return null;
+  const res = await pool.query('SELECT * FROM email_messages WHERE id = $1', [id]);
+  return res.rows[0] || null;
+}
+
+/**
+ * Update an outbox message's status/error fields.
+ */
+export async function updateEmailMessage(id, patch) {
+  if (!id) return { updated: false };
+  const fields = Object.keys(patch).map((k, i) => `${k} = $${i + 1}`).join(', ');
+  const vals = [id, ...Object.values(patch)];
+  const res = await pool.query(
+    `UPDATE email_messages SET ${fields}, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`,
+    vals
+  );
+  return { updated: res.rowCount > 0, row: res.rows[0] || null };
+}
+
+/**
+ * Record a provider lifecycle event (sent / delivered / opened / clicked /
+ * bounced / failed) in the event ledger, linked to an outbox message.
+ */
+export async function recordEmailEvent({ messageId, eventType, providerResponse = {} }) {
+  const id = crypto.randomUUID();
+  const res = await pool.query(
+    `INSERT INTO email_events (id, message_id, event_type, provider_response)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+    [id, messageId, eventType, JSON.stringify(providerResponse)]
+  );
+  return { row: res.rows[0], created: true };
+}
+
+/**
+ * Check whether a recipient (canonical lowercase) is on the suppression list.
+ * Returns the DB row or null.
+ */
+export async function isEmailSuppressed(email) {
+  if (!email) return null;
+  const canonical = String(email || '').trim().toLowerCase();
+  const res = await pool.query(
+    'SELECT * FROM email_suppressions WHERE email = $1',
+    [canonical]
+  );
+  return res.rows[0] || null;
+}

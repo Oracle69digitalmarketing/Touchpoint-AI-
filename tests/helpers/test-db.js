@@ -72,6 +72,15 @@ const TABLES_TO_TRUNCATE = [
   'products',
 ];
 
+const MIGRATION_PATH = path.join(__dirname, '..', '..', 'migrations');
+const MIGRATION_FILES = [
+  '012-email-outbox.sql',
+  '013-email-events.sql',
+  '014-email-suppressions.sql',
+  '015-email-jobs.sql',
+  '016-email-schema-compatibility.sql',
+];
+
 let schemaApplied = false;
 
 /**
@@ -120,6 +129,14 @@ export async function setupTestDb() {
     ].join('\n');
 
     await pool.query(sql);
+
+// Apply Phase 15 email infrastructure migrations (idempotent, IF NOT EXISTS)
+    for (const migrationFile of MIGRATION_FILES) {
+      const migrationPath = path.join(MIGRATION_PATH, migrationFile);
+      const migrationSql = fs.readFileSync(migrationPath, 'utf8');
+      await pool.query(migrationSql);
+    }
+
     schemaApplied = true;
   }
 

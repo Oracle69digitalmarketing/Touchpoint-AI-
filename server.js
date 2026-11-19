@@ -161,6 +161,8 @@ import {
   updateCommercialActionMetadata,
   BookingConflictError,
   isPlatformOwner,
+  reissueVerificationToken,
+  recordEmailMessage,
 } from './db-pg.js';
 import { PLAN_LIMITS } from './plan-limits.js';
 import { CHANNELS, SUPPORTED_CHANNELS, assertChannel, sendWhatsAppMessage, _setWhatsAppHttp as setWhatsAppProviderHttp } from './channel-adapter.js';
@@ -639,6 +641,34 @@ app.get('/v1/auth/verify-email/:token', asyncHandler(async (req, res) => {
   return res.json({ message: 'Email verified successfully' });
 }));
 
+app.post('/v1/auth/resend-verification', asyncHandler(async (req, res) => {
+  const { verifyResendWebhook } = await import('./services/email.js');
+  const { email } = req.body || {};
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) return res.status(400).json({ error: 'Email is required' });
+  // Check if user exists and is not already verified
+  const user = await pool.query('SELECT id, email_verified, verification_token, verification_expires_at FROM users WHERE email = $1', [normalizedEmail]);
+  if (user.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+  if (user.rows[0].email_verified) return res.status(200).json({ message: 'Email already verified' });
+  // Verify the resend webhook to confirm the request is legitimate
+  const rawBody = req.rawBody instanceof Buffer ? req.rawBody.toString() : String(req.rawBody || '');
+  const verified = await verifyResendWebhook({ rawBody, headers: req.headers });
+  if (!verified.verified) return res.status(401).json({ error: 'Invalid webhook signature', reason: verified.reason });
+  // Reissue the verification token
+  const expiresAt = new Date(Date.now() + 86400e3); // 24 hours
+  const token = await reissueVerificationToken(user.rows[0].id, crypto.randomUUID(), expiresAt);
+  if (!token) return res.status(500).json({ error: 'Failed to reissue token' });
+  // Record the email in the outbox
+  const { row: emailRow } = await recordEmailMessage({
+    businessId: user.rows[0].business_id,
+    kind: 'auth_verification',
+    recipient: normalizedEmail,
+    category: 'auth_verification',
+    payload: { email: normalizedEmail },
+  });
+  return res.status(200).json({ message: 'If an account needs verification, a new email has been sent.' });
+}));
+
 app.post('/v1/auth/login', asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
 
@@ -1073,6 +1103,20 @@ app.post('/v1/billing/webhook', asyncHandler(async (req, res) => {
   const eventId = normalizeWebhookEventId(event, data);
 
   res.status(200).json(await handlePaystackSubscriptionEvent({ eventType, eventId, data }));
+}));
+
+app.post('/v1/webhooks/resend', asyncHandler(async (req, res) => {
+  const { verifyResendWebhook } = await import('./services/email.js');
+  const rawBody = req.rawBody instanceof Buffer ? req.rawBody.toString() : String(req.rawBody || '');
+  const verified = await verifyResendWebhook({ rawBody, headers: req.headers });
+  if (verified.verified) {
+    const event = verified.event || {};
+    res.status(200).json({ received: true, event: event.name || event.type || 'unknown' });
+  } else {
+    const response = { error: 'Invalid webhook signature' };
+    if (verified.reason) response.reason = verified.reason;
+    return res.status(401).json(response);
+  }
 }));
 
 /**
@@ -6413,3 +6457,4 @@ if (isMainModule) {
 }
 
 export default app;
+export { closeDatabase };

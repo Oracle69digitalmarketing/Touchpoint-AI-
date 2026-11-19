@@ -41,6 +41,7 @@ const NORMALIZED_ENV_KEYS = [
   'TRUST_PROXY',
   'PAYMENT_PROVIDER',
   'RESEND_API_KEY',
+  'RESEND_WEBHOOK_SECRET',
   'EMAIL_FROM',
   'WHATSAPP_ACCESS_TOKEN',
   'WHATSAPP_PHONE_NUMBER_ID',
@@ -211,6 +212,7 @@ export function loadConfig(rawEnv = process.env) {
     groqApiKey: env.GROQ_API_KEY,
     paystackSecretKey: env.PAYSTACK_SECRET_KEY,
     resendApiKey: env.RESEND_API_KEY,
+    resendWebhookSecret: env.RESEND_WEBHOOK_SECRET,
     emailFrom: env.EMAIL_FROM,
     appUrl,
     corsOrigins: (env.CORS_ORIGIN || 'http://localhost:3000')
