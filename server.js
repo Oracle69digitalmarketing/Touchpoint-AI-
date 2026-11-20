@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 import 'dotenv/config';
 import jwt from 'jsonwebtoken';
+import { requireCapability } from './services/require-capability.js';
 import bcrypt from 'bcryptjs';
 import Groq from 'groq-sdk';
 import { Resend } from 'resend';
@@ -641,7 +642,7 @@ app.get('/v1/auth/verify-email/:token', asyncHandler(async (req, res) => {
   return res.json({ message: 'Email verified successfully' });
 }));
 
-app.post('/v1/auth/resend-verification', asyncHandler(async (req, res) => {
+app.post('/v1/auth/resend-verification', requireAuth, requireCapability('CAP_EMAIL_OUTBOX'), asyncHandler(async (req, res) => {
   const { verifyResendWebhook } = await import('./services/email.js');
   const { email } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
