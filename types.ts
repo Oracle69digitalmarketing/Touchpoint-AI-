@@ -5,6 +5,7 @@ export interface Business {
   name: string;
   slug: string;
   plan?: SubscriptionPlan;
+  is_platform_owner?: boolean;
 }
 
 export interface User {

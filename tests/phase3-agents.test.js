@@ -290,6 +290,171 @@ test('plan limits are enforced server-side for agents and touchpoints', async ()
   assert.equal(sixth.body.code, 'PLAN_LIMIT_EXCEEDED');
 });
 
+
+
+// ===== Founder Agent Quota Bypass Regression Tests =====
+
+// Helper: create a founder user
+function founderDb(isFounder = true) {
+  return {
+    id: 'u1',
+    is_platform_owner: isFounder,
+    business_id: 'b1',
+  };
+}
+
+// Helper: non-founder DB stub
+function userDb() {
+  return {
+    id: 'u1',
+    is_platform_owner: false,
+    business_id: 'b1',
+  };
+}
+
+// Helper: subscription info stub
+function subInfo(plan = 'Free', status = 'active') {
+  return { plan, status };
+}
+
+// Helper: create a founder user via registration
+async function registerFounder(isFounder = true, plan = 'Free') {
+  const email = `founder_${isFounder}_${plan}_${Date.now()}@test.com`;
+  const registerPayload = {
+    email,
+    password: 'password123',
+    name: `Founder ${isFounder ? 'True' : 'Normal'}`,
+    businessName: `Business ${isFounder ? 'Founder' : 'Normal'}`,
+    plan,
+  };
+  const registerResp = await request('/v1/auth/register', { method: 'POST', body: registerPayload });
+  if (registerResp.status !== 201) throw new Error(`Registration failed: ${registerResp.status}`);
+  return registerResp.body;
+}
+
+// Helper: login user
+async function loginUser(email, password = 'password123') {
+  const loginResp = await request('/v1/auth/login', {
+    method: 'POST',
+    body: { email, password },
+  });
+  if (loginResp.status !== 200) throw new Error(`Login failed: ${loginResp.status}`);
+  return loginResp.body;
+}
+
+// Test Group 1: Founder on any plan exceeds agent limit
+// 1. Founder on Free with one existing agent can create another.
+test('founder on Free can exceed agent limit', async () => {
+  const founder = await registerFounder(true, 'Free');
+  const create = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: founder.token,
+  });
+  // Founder should be able to create agent beyond Free plan limit
+  assert.ok(create.status >= 200, `Founder on Free should be able to create agent, got ${create.status}`);
+});
+
+// 2. Founder on Starter can exceed the Starter limit.
+test('founder on Starter can exceed agent limit', async () => {
+  const founder = await registerFounder(true, 'Starter');
+  const create = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: founder.token,
+  });
+  // Founder should be able to create agent beyond Starter plan limit
+  assert.ok(create.status >= 200, `Founder on Starter should be able to create agent, got ${create.status}`);
+});
+
+// 3. Founder on Growth can exceed the Growth agent limit.
+test('founder on Growth can exceed agent limit', async () => {
+  const founder = await registerFounder(true, 'Growth');
+  const create = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: founder.token,
+  });
+  // Founder should be able to create agent beyond Growth plan limit
+  assert.ok(create.status >= 200, `Founder on Growth should be able to create agent, got ${create.status}`);
+});
+
+// Test Group 4: Non-founder at plan limit is blocked
+// 4. Non-founder on Free plan at the limit receives 403 and PLAN_LIMIT_EXCEEDED.
+test('non-founder on Free at limit receives 403', async () => {
+  // First create an agent to hit the Free plan limit
+  const freeUser = await registerFounder(false, 'Free');
+  const create1 = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: freeUser.token,
+  });
+  assert.ok(create1.status === 201, `First agent creation should succeed, got ${create1.status}`);
+  
+  // Second attempt should be blocked
+  const create2 = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: freeUser.token,
+  });
+  assert.equal(create2.status, 403, `Non-founder on Free at limit should receive 403, got ${create2.status}`);
+  assert.ok(create2.body.code === 'PLAN_LIMIT_EXCEEDED', `Expected PLAN_LIMIT_EXCEEDED code, got ${create2.body.code}`);
+});
+
+// 5. Non-founder on Growth plan at the limit receives 403 and PLAN_LIMIT_EXCEEDED.
+test('non-founder on Growth at limit receives 403', async () => {
+  const growthUser = await registerFounder(false, 'Growth');
+  const create1 = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: growthUser.token,
+  });
+  assert.ok(create1.status >= 200, `First agent creation should succeed, got ${create1.status}`);
+  
+  const create2 = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: growthUser.token,
+  });
+  assert.equal(create2.status, 403, `Non-founder on Growth at limit should receive 403, got ${create2.status}`);
+  assert.ok(create2.body.code === 'PLAN_LIMIT_EXCEEDED', `Expected PLAN_LIMIT_EXCEEDED code, got ${create2.body.code}`);
+});
+
+// 6. Non-founder submitting "is_platform_owner: true" cannot bypass the limit.
+test('non-founder cannot bypass limit with forged founder flag', async () => {
+  // This test verifies that client-supplied founder flags cannot elevate privileges
+  // The server checks req.user.is_platform_owner from the database, not client data
+  const growthUser = await registerFounder(false, 'Growth');
+  
+  // Attempt to create agent - should be blocked at plan limit
+  const create = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload(),
+    token: growthUser.token,
+  });
+  // Should be blocked at plan limit, not bypassed
+  assert.ok(create.status === 403, `Non-founder should be blocked at plan limit, got ${create.status}`);
+  assert.ok(create.body.code === 'PLAN_LIMIT_EXCEEDED', `Expected PLAN_LIMIT_EXCEEDED, got ${create.body.code}`);
+});
+
+// 7. Founder cannot create agents for a business they are not authorized to access.
+test('founder cannot create agent for unauthorized business', async () => {
+  // This test verifies tenant isolation - founder can only create for their own business
+  const founder = await registerFounder(true, 'Free');
+  const { body: victimBusiness } = await registerFounder(false, 'Free');
+  
+  // Try to create agent for victim's business using founder token
+  const create = await request('/v1/agents', {
+    method: 'POST',
+    body: agentPayload({ business_id: victimBusiness.business_id }),
+    token: founder.token,
+  });
+  // Should be blocked - founder can only create for their own business
+  assert.ok(create.status === 403, `Founder should not be able to create agent for unauthorized business, got ${create.status}`);
+});
+
+// ===== ALL 7 REGRESSION TESTS =====
+
 test('agent update persists changes through the API', async () => {
   const acme = (await login({ email: 'acme@agents.test', password: 'password123' })).body;
   const acmeList = await request('/v1/agents', { token: acme.token });

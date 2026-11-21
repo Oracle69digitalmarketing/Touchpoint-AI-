@@ -200,16 +200,30 @@ const Workspace: React.FC = () => {
   };
 
   const handleOpenWizard = (agent?: Agent | null) => {
-    if (!agent) {
+  // Platform owners bypass agent-count restrictions — backend enforcement is authoritative
+  if (!agent) {
+    // Check if the authenticated user is a platform owner
+    const isFounder = business?.is_platform_owner;
+    if (isFounder) {
+      // Founders have full agent access — no frontend quota check
+      setEditingAgent(agent || null);
+      setIsWizardOpen(true);
+    } else {
+      // Non-founders: check plan limit
       const limits = PLAN_LIMITS[subscription];
       if (agents.length >= limits.agents) {
         alert(`Limit Reached: Your ${subscription} plan supports up to ${limits.agents} agent(s).`);
         return;
       }
+      setEditingAgent(agent || null);
+      setIsWizardOpen(true);
     }
+  } else {
+    // Editing an existing agent retains its existing behavior
     setEditingAgent(agent || null);
     setIsWizardOpen(true);
-  };
+  }
+};
 
   const handleWizardComplete = async (data: AgentInput) => {
     try {

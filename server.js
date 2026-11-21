@@ -2704,13 +2704,18 @@ app.post('/v1/agents', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Validation failed', fields: errors });
   }
 
-  const plan = req.business.plan || 'Free';
-  const limit = PLAN_LIMITS[plan] ? PLAN_LIMITS[plan].agents : PLAN_LIMITS.Free.agents;
-  if (await countAgents(req.business.id) >= limit) {
-    return res.status(403).json({
-      error: `Agent limit reached: your ${plan} plan supports up to ${limit} agent(s).`,
-      code: 'PLAN_LIMIT_EXCEEDED',
-    });
+  // Platform owners bypass agent-count restrictions
+  if (req.user && req.user.is_platform_owner) {
+    // Founders have full agent access — no quota enforcement
+  } else {
+    const plan = req.business.plan || 'Free';
+    const limit = PLAN_LIMITS[plan] ? PLAN_LIMITS[plan].agents : PLAN_LIMITS.Free.agents;
+    if (await countAgents(req.business.id) >= limit) {
+      return res.status(403).json({
+        error: `Agent limit reached: your ${plan} plan supports up to ${limit} agent(s).`,
+        code: 'PLAN_LIMIT_EXCEEDED',
+      });
+    }
   }
 
   const body = req.body;
