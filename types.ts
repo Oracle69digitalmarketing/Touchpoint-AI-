@@ -5,7 +5,6 @@ export interface Business {
   name: string;
   slug: string;
   plan?: SubscriptionPlan;
-  is_platform_owner?: boolean;
 }
 
 export interface User {
@@ -13,6 +12,7 @@ export interface User {
   email: string;
   name: string;
   role: string;
+  is_platform_owner?: boolean;
 }
 
 export interface AuthResponse {

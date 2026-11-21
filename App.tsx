@@ -203,7 +203,7 @@ const Workspace: React.FC = () => {
   // Platform owners bypass agent-count restrictions — backend enforcement is authoritative
   if (!agent) {
     // Check if the authenticated user is a platform owner
-    const isFounder = business?.is_platform_owner;
+    const isFounder = user?.is_platform_owner;
     if (isFounder) {
       // Founders have full agent access — no frontend quota check
       setEditingAgent(agent || null);

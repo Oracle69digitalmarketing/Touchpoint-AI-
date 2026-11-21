@@ -465,6 +465,7 @@ const publicUser = (user) => ({
   email: user.email,
   name: user.name,
   role: user.role,
+  is_platform_owner: user.is_platform_owner,
 });
 
 const publicBusiness = (business) => ({
