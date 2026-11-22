@@ -67,7 +67,7 @@ const App: React.FC = () => {
 };
 
 const Workspace: React.FC = () => {
-  const { business, logout } = useAuth();
+  const { business, user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
